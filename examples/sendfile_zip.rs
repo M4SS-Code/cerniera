@@ -48,13 +48,10 @@ fn main() -> io::Result<()> {
 
         // Transfer file data kernel-to-kernel via sendfile.
         let mut offset: i64 = 0;
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "files > usize::MAX unsupported"
-        )]
-        let mut remaining = len as usize;
+        let mut remaining = len;
         while remaining > 0 {
-            let n = nix::sys::sendfile::sendfile(&out, &src, Some(&mut offset), remaining)
+            let chunk = usize::try_from(remaining).unwrap_or(usize::MAX);
+            let n = nix::sys::sendfile::sendfile(&out, &src, Some(&mut offset), chunk)
                 .map_err(io::Error::from)?;
             if n == 0 {
                 return Err(io::Error::new(
@@ -62,7 +59,7 @@ fn main() -> io::Result<()> {
                     "sendfile wrote 0 bytes",
                 ));
             }
-            remaining -= n;
+            remaining -= n as u64;
         }
 
         archive.end_file(&mut buf);
