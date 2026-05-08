@@ -23,12 +23,12 @@ rust:clippy:
   before_script:
     - rustup component add clippy
   script:
-    - cargo clippy --all-features -- -D warnings
+    - cargo clippy --locked --all-features -- -D warnings
 
 rust:test:
   stage: test
   image: rust:1.95-alpine3.23
   script:
-    - cargo test
-    - cargo test --no-default-features
-    - cargo test --all-features
+    - cargo test --locked
+    - cargo test --locked --no-default-features
+    - cargo test --locked --all-features
