@@ -47,11 +47,11 @@ fn main() -> io::Result<()> {
         }
 
         // Transfer file data kernel-to-kernel via sendfile.
-        let mut offset: i64 = 0;
+        let mut offset: u64 = 0;
         let mut remaining = len;
         while remaining > 0 {
             let chunk = usize::try_from(remaining).unwrap_or(usize::MAX);
-            let n = nix::sys::sendfile::sendfile(&out, &src, Some(&mut offset), chunk)
+            let n = rustix::fs::sendfile(&out, &src, Some(&mut offset), chunk)
                 .map_err(io::Error::from)?;
             if n == 0 {
                 return Err(io::Error::new(
