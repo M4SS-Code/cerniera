@@ -13,7 +13,7 @@ use tokio::{fs::File, io::AsyncWriteExt};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> io::Result<()> {
-    let modified = MsDosDateTime::new(2026, 3, 10, 12, 30, 0);
+    let modified = MsDosDateTime::new(2026, 3, 10, 12, 30, 0).unwrap();
 
     let entries: Vec<io::Result<_>> = vec![
         Ok(ZipEntry::File {

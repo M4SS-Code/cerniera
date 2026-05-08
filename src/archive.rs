@@ -1,4 +1,5 @@
 use alloc::{string::String, vec::Vec};
+use core::fmt;
 
 use bytes::{BufMut, BytesMut};
 use crc32fast::Hasher as Crc32Hasher;
@@ -22,6 +23,19 @@ const VERSION_MADE_BY: u16 = (3 << 8) | 0x2D;
 
 // ── Date / time ──────────────────────────────────────────────────────────────
 
+/// Error returned when [`MsDosDateTime::new`] is given an invalid date or time.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct InvalidMsDosDateTime;
+
+impl fmt::Display for InvalidMsDosDateTime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid MS-DOS date/time")
+    }
+}
+
+impl core::error::Error for InvalidMsDosDateTime {}
+
 /// MS-DOS date and time as stored in ZIP file headers.
 ///
 /// The default value is all zeros, which most extractors display as
@@ -37,39 +51,67 @@ pub struct MsDosDateTime {
 impl MsDosDateTime {
     /// Create from individual calendar components.
     ///
-    /// Values are packed as-is with no validation. Out-of-range inputs
-    /// will produce a garbage timestamp but will not panic.
+    /// Returns `None` if any field is out of the valid MS-DOS range.
+    /// The day is validated against the actual number of days in the given
+    /// month and year (including leap years for February).
     ///
     /// * `year` - 1980..=2107
     /// * `month` - 1..=12
-    /// * `day` - 1..=31
+    /// * `day` - 1..=days-in-month
     /// * `hour` - 0..=23
     /// * `minute` - 0..=59
-    /// * `second` - 0..=58 (rounded down to even)
+    /// * `second` - 0..=59 (truncated to even)
     #[must_use]
-    pub const fn new(year: u16, month: u16, day: u16, hour: u16, minute: u16, second: u16) -> Self {
-        Self {
+    pub const fn new(
+        year: u16,
+        month: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+    ) -> Option<Self> {
+        if year < 1980
+            || year > 2107
+            || month < 1
+            || month > 12
+            || day < 1
+            || day > days_in_month(year, month)
+            || second > 59
+        {
+            return None;
+        }
+        Some(Self {
             time: (hour << 11) | (minute << 5) | (second / 2),
             date: ((year - 1980) << 9) | (month << 5) | day,
-        }
+        })
+    }
+}
+
+/// Return the number of days in the given month and year.
+///
+/// Returns `0` for months outside 1..=12.
+const fn days_in_month(year: u16, month: u16) -> u16 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year.is_multiple_of(4) && !year.is_multiple_of(100) || year.is_multiple_of(400) => 29,
+        2 => 28,
+        _ => 0,
     }
 }
 
 #[cfg(feature = "jiff")]
-impl From<jiff::civil::DateTime> for MsDosDateTime {
-    #[expect(
-        clippy::cast_sign_loss,
-        reason = "jiff date/time components are non-negative"
-    )]
-    fn from(dt: jiff::civil::DateTime) -> Self {
-        Self::new(
-            dt.year() as u16,
-            dt.month() as u16,
-            dt.day() as u16,
-            dt.hour() as u16,
-            dt.minute() as u16,
-            dt.second() as u16,
-        )
+impl TryFrom<jiff::civil::DateTime> for MsDosDateTime {
+    type Error = InvalidMsDosDateTime;
+
+    fn try_from(dt: jiff::civil::DateTime) -> Result<Self, Self::Error> {
+        let year: u16 = dt.year().try_into().map_err(|_| InvalidMsDosDateTime)?;
+        let month: u16 = dt.month().try_into().map_err(|_| InvalidMsDosDateTime)?;
+        let day: u16 = dt.day().try_into().map_err(|_| InvalidMsDosDateTime)?;
+        let hour: u16 = dt.hour().try_into().map_err(|_| InvalidMsDosDateTime)?;
+        let minute: u16 = dt.minute().try_into().map_err(|_| InvalidMsDosDateTime)?;
+        let second: u16 = dt.second().try_into().map_err(|_| InvalidMsDosDateTime)?;
+        Self::new(year, month, day, hour, minute, second).ok_or(InvalidMsDosDateTime)
     }
 }
 

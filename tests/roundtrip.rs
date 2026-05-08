@@ -31,7 +31,7 @@ fn empty_archive() {
 #[test]
 fn single_stored_file() {
     let content = b"Hello, cerniera!";
-    let modified = MsDosDateTime::new(2026, 3, 10, 12, 30, 0);
+    let modified = MsDosDateTime::new(2026, 3, 10, 12, 30, 0).unwrap();
 
     let zip_bytes = build_archive(|archive, buf, out| {
         archive.start_file("hello.txt".into(), modified, CompressionMethod::Stored, buf);
@@ -58,7 +58,7 @@ fn single_stored_file() {
 
 #[test]
 fn multiple_files_and_directory() {
-    let modified = MsDosDateTime::new(2026, 3, 10, 14, 0, 0);
+    let modified = MsDosDateTime::new(2026, 3, 10, 14, 0, 0).unwrap();
 
     let zip_bytes = build_archive(|archive, buf, out| {
         // Directory
@@ -117,7 +117,7 @@ fn deflate_compressed_file() {
     use std::io::Write;
 
     let content = b"the quick brown fox jumps over the lazy dog, again and again and again";
-    let modified = MsDosDateTime::new(2026, 3, 10, 16, 0, 0);
+    let modified = MsDosDateTime::new(2026, 3, 10, 16, 0, 0).unwrap();
 
     let zip_bytes = build_archive(|archive, buf, out| {
         archive.start_file(

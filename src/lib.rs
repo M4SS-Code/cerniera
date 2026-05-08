@@ -22,7 +22,7 @@
 //!
 //! # #[tokio::main(flavor = "current_thread")]
 //! # async fn main() -> io::Result<()> {
-//! let modified = MsDosDateTime::new(2026, 3, 10, 12, 30, 0);
+//! let modified = MsDosDateTime::new(2026, 3, 10, 12, 30, 0).unwrap();
 //!
 //! let entries = stream::iter([
 //!     Ok(ZipEntry::File {
@@ -69,5 +69,5 @@ extern crate alloc;
 pub mod archive;
 mod stream;
 
-pub use self::archive::{CompressionMethod, MsDosDateTime, ZipArchive};
+pub use self::archive::{CompressionMethod, InvalidMsDosDateTime, MsDosDateTime, ZipArchive};
 pub use self::stream::{ZipEntry, ZipWriter};

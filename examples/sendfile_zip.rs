@@ -31,7 +31,8 @@ fn main() -> io::Result<()> {
             .expect("modification time out of range")
             .to_zoned(TimeZone::system())
             .datetime()
-            .into();
+            .try_into()
+            .expect("modification time out of MS-DOS range");
 
         archive.start_file(path, modified, CompressionMethod::Stored, &mut buf);
         out.write_all(&buf)?;
