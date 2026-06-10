@@ -76,6 +76,8 @@ impl MsDosDateTime {
             || month > 12
             || day < 1
             || day > days_in_month(year, month)
+            || hour > 23
+            || minute > 59
             || second > 59
         {
             return None;
@@ -701,6 +703,31 @@ mod tests {
         assert_eq!(u32le(&zip, cd), SIG_CENTRAL, "CD sig");
         let ext_attr = u32le(&zip, cd + 38);
         assert_eq!(ext_attr >> 16 & 0o170_000, 0o040_000, "S_IFDIR bit");
+    }
+
+    #[test]
+    fn ms_dos_date_time_validation() {
+        // Extremes of every valid range are accepted.
+        assert!(MsDosDateTime::new(1980, 1, 1, 0, 0, 0).is_some());
+        assert!(MsDosDateTime::new(2107, 12, 31, 23, 59, 59).is_some());
+
+        // Each component out of range is rejected.
+        assert!(MsDosDateTime::new(1979, 12, 31, 0, 0, 0).is_none());
+        assert!(MsDosDateTime::new(2108, 1, 1, 0, 0, 0).is_none());
+        assert!(MsDosDateTime::new(2020, 0, 1, 0, 0, 0).is_none());
+        assert!(MsDosDateTime::new(2020, 13, 1, 0, 0, 0).is_none());
+        assert!(MsDosDateTime::new(2020, 1, 0, 0, 0, 0).is_none());
+        assert!(MsDosDateTime::new(2020, 4, 31, 0, 0, 0).is_none());
+        assert!(MsDosDateTime::new(2020, 1, 1, 24, 0, 0).is_none());
+        assert!(MsDosDateTime::new(2020, 1, 1, 99, 0, 0).is_none());
+        assert!(MsDosDateTime::new(2020, 1, 1, 0, 60, 0).is_none());
+        assert!(MsDosDateTime::new(2020, 1, 1, 0, 0, 60).is_none());
+
+        // Leap year handling for February.
+        assert!(MsDosDateTime::new(2024, 2, 29, 0, 0, 0).is_some());
+        assert!(MsDosDateTime::new(2026, 2, 29, 0, 0, 0).is_none());
+        assert!(MsDosDateTime::new(2000, 2, 29, 0, 0, 0).is_some());
+        assert!(MsDosDateTime::new(2100, 2, 29, 0, 0, 0).is_none());
     }
 
     #[test]
