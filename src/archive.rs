@@ -381,7 +381,7 @@ impl Default for ZipArchive {
 /// Local file header: 30 bytes fixed + `name.len()`.
 ///
 /// CRC-32 and sizes are all zero because GP bit 3 (data descriptor) is set.
-/// The real values appear in the ZIP64 data descriptor that follows the file
+/// The real values appear in the data descriptor that follows the file
 /// data, and in the central directory's ZIP64 extra field.
 #[expect(
     clippy::cast_possible_truncation,
@@ -410,9 +410,14 @@ fn encode_local_header(
     b.put_slice(name);
 }
 
-/// ZIP64 data descriptor: 24 bytes.
+/// Data descriptor: 16 bytes, or 24 bytes for entries of 4 GiB or larger.
 ///
-/// `sig(4) + crc32(4) + compressed_size(8) + uncompressed_size(8)`
+/// `sig(4) + crc32(4) + compressed_size(4|8) + uncompressed_size(4|8)`
+///
+/// The local header carries no ZIP64 extra field, so readers expect the
+/// classic 4-byte sizes (APPNOTE 4.5.3); extractors that do handle 8-byte
+/// descriptors detect them from the actual data size. Use 4-byte sizes
+/// whenever they fit and the ZIP64 form only when a size needs 8 bytes.
 fn encode_data_descriptor(
     crc32: u32,
     compressed_size: u64,
@@ -422,8 +427,16 @@ fn encode_data_descriptor(
     b.reserve(24);
     b.put_u32_le(SIG_DATA_DESC);
     b.put_u32_le(crc32);
-    b.put_u64_le(compressed_size);
-    b.put_u64_le(uncompressed_size);
+    if let (Ok(compressed), Ok(uncompressed)) = (
+        u32::try_from(compressed_size),
+        u32::try_from(uncompressed_size),
+    ) {
+        b.put_u32_le(compressed);
+        b.put_u32_le(uncompressed);
+    } else {
+        b.put_u64_le(compressed_size);
+        b.put_u64_le(uncompressed_size);
+    }
 }
 
 /// Central directory file header: 46 bytes fixed + `name.len()` + 28 bytes ZIP64 extra.
@@ -554,7 +567,7 @@ mod tests {
     // ── Layout constants ──────────────────────────────────────────────────────
     //
     //  Local header  = 30 + name_len        (no extra field)
-    //  Data descr.   = 24                  (sig+crc+comp_size64+orig_size64)
+    //  Data descr.   = 16                  (sig+crc+comp_size+orig_size; 24 if ≥ 4 GiB)
     //  CD entry      = 46 + name_len + 28  (ZIP64 extra: tag+len+orig+comp+off)
     //  ZIP64 EOCD    = 56
     //  ZIP64 locator = 20
@@ -638,11 +651,11 @@ mod tests {
             h.finalize()
         };
         assert_eq!(u32le(&zip, dd + 4), expected_crc, "crc32");
-        assert_eq!(u64le(&zip, dd + 8), content.len() as u64, "comp size64");
-        assert_eq!(u64le(&zip, dd + 16), content.len() as u64, "orig size64");
+        assert_eq!(u32le(&zip, dd + 8), content.len() as u32, "comp size");
+        assert_eq!(u32le(&zip, dd + 12), content.len() as u32, "orig size");
 
         // ── Central directory ─────────────────────────────────────────────
-        let cd = dd + 24;
+        let cd = dd + 16;
         assert_eq!(u32le(&zip, cd), SIG_CENTRAL);
         assert_eq!(u16le(&zip, cd + 4), VERSION_MADE_BY);
         assert_eq!(u32le(&zip, cd + 20), 0xFFFF_FFFF, "comp size sentinel");
@@ -697,12 +710,37 @@ mod tests {
         });
 
         let name_len = u16le(&zip, 26) as usize;
-        // local header + 0 payload + 24-byte ZIP64 descriptor
-        let cd = 30 + name_len + 24;
+        // local header + 0 payload + 16-byte descriptor
+        let cd = 30 + name_len + 16;
 
         assert_eq!(u32le(&zip, cd), SIG_CENTRAL, "CD sig");
         let ext_attr = u32le(&zip, cd + 38);
         assert_eq!(ext_attr >> 16 & 0o170_000, 0o040_000, "S_IFDIR bit");
+    }
+
+    #[test]
+    fn data_descriptor_widths() {
+        // Classic 16-byte form when both sizes fit in 32 bits.
+        let mut b = BytesMut::new();
+        encode_data_descriptor(0xDEAD_BEEF, 1234, 5678, &mut b);
+        assert_eq!(b.len(), 16);
+        assert_eq!(u32le(&b, 0), SIG_DATA_DESC);
+        assert_eq!(u32le(&b, 4), 0xDEAD_BEEF);
+        assert_eq!(u32le(&b, 8), 1234);
+        assert_eq!(u32le(&b, 12), 5678);
+
+        // The largest sizes still representable in 4 bytes stay classic.
+        let max32 = u64::from(u32::MAX);
+        let mut b = BytesMut::new();
+        encode_data_descriptor(1, max32, max32, &mut b);
+        assert_eq!(b.len(), 16);
+
+        // ZIP64 24-byte form once either size needs 8 bytes.
+        let mut b = BytesMut::new();
+        encode_data_descriptor(1, max32 + 1, 42, &mut b);
+        assert_eq!(b.len(), 24);
+        assert_eq!(u64le(&b, 8), max32 + 1);
+        assert_eq!(u64le(&b, 16), 42);
     }
 
     #[test]
@@ -768,7 +806,7 @@ mod tests {
 
         // Compute expected start of second local header.
         let name_len_a = u16le(&zip, 26) as usize; // 5 for "a.txt"
-        let local_b = (30 + name_len_a + 4 + 24) as u64;
+        let local_b = (30 + name_len_a + 4 + 16) as u64;
         assert_eq!(u32le(&zip, local_b as usize), SIG_LOCAL, "second local sig");
 
         // Navigate to ZIP64 EOCD via the locator embedded in the standard EOCD tail.
