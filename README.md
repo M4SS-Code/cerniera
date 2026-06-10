@@ -20,13 +20,13 @@ use tokio::{fs::File, io::AsyncWriteExt};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> io::Result<()> {
-    let modified = MsDosDateTime::new(2026, 3, 10, 12, 30, 0);
+    let modified = MsDosDateTime::new(2026, 3, 10, 12, 30, 0).unwrap();
 
     let entries = stream::iter([
         Ok(ZipEntry::File {
             path: "hello.txt".into(),
             modified,
-            content: stream::iter([Ok(Bytes::from_static(b"Hello, world!"))]),
+            content: stream::iter([Ok::<_, io::Error>(Bytes::from_static(b"Hello, world!"))]),
         }),
         Ok(ZipEntry::Directory {
             path: "subdir/".into(),
@@ -60,7 +60,7 @@ async fn main() -> io::Result<()> {
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `std`   | Yes     | Enables runtime SIMD detection for faster CRC-32. Everything works without it. |
-| `jiff`  | No      | Adds `From<jiff::civil::DateTime>` for `MsDosDateTime`. |
+| `jiff`  | No      | Adds `TryFrom<jiff::civil::DateTime>` for `MsDosDateTime`. |
 
 ## License
 

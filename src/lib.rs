@@ -60,7 +60,7 @@
 //! # Features
 //!
 //! - **`std`** *(default)* - enables runtime SIMD detection for faster CRC-32.
-//! - **`jiff`** - adds `From<jiff::civil::DateTime>` for [`MsDosDateTime`].
+//! - **`jiff`** - adds `TryFrom<jiff::civil::DateTime>` for [`MsDosDateTime`].
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
