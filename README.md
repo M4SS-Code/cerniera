@@ -24,12 +24,12 @@ async fn main() -> io::Result<()> {
 
     let entries = stream::iter([
         Ok(ZipEntry::File {
-            path: "hello.txt".into(),
+            path: "hello.txt".try_into().unwrap(),
             modified,
             content: stream::iter([Ok::<_, io::Error>(Bytes::from_static(b"Hello, world!"))]),
         }),
         Ok(ZipEntry::Directory {
-            path: "subdir/".into(),
+            path: "subdir/".try_into().unwrap(),
             modified,
         }),
     ]);

@@ -1,4 +1,4 @@
-use alloc::{string::String, vec::Vec};
+use alloc::{borrow::Cow, string::String, vec::Vec};
 use core::fmt;
 
 use bytes::{BufMut, BytesMut};
@@ -117,6 +117,122 @@ impl TryFrom<jiff::civil::DateTime> for MsDosDateTime {
     }
 }
 
+// ── Paths ─────────────────────────────────────────────────────────────────────
+
+/// Error returned when a path does not fit ZIP's 16-bit name length field.
+///
+/// Returned by [`ZipPath::new`]. The rejected path can be recovered with
+/// [`into_inner`](Self::into_inner).
+#[derive(Debug)]
+pub struct InvalidZipPath {
+    path: Cow<'static, str>,
+}
+
+impl InvalidZipPath {
+    /// Return the rejected path.
+    #[must_use]
+    pub fn into_inner(self) -> Cow<'static, str> {
+        self.path
+    }
+}
+
+impl fmt::Display for InvalidZipPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "file name length {} exceeds 65535 bytes",
+            self.path.len()
+        )
+    }
+}
+
+impl core::error::Error for InvalidZipPath {}
+
+/// A ZIP entry path, validated to fit the format's 16-bit name length field.
+///
+/// Holds a [`Cow`], so paths built from `&'static str` (e.g. string
+/// literals) don't allocate:
+///
+/// ```rust
+/// use cerniera::ZipPath;
+///
+/// // Borrowed - no allocation.
+/// let path = ZipPath::new("docs/report.pdf").unwrap();
+/// // Owned.
+/// let path: ZipPath = String::from("docs/report.pdf").try_into().unwrap();
+/// ```
+///
+/// Paths are stored as-is: cerniera does not normalize separators or reject
+/// special components such as `..`; callers zipping untrusted names should
+/// sanitize them first.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ZipPath(Cow<'static, str>);
+
+impl ZipPath {
+    /// Validate that `path` fits the 16-bit name length field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidZipPath`] if `path` is longer than 65535 bytes;
+    /// the rejected path can be recovered from the error.
+    pub fn new(path: impl Into<Cow<'static, str>>) -> Result<Self, InvalidZipPath> {
+        let path = path.into();
+        if u16::try_from(path.len()).is_ok() {
+            Ok(Self(path))
+        } else {
+            Err(InvalidZipPath { path })
+        }
+    }
+
+    /// View the path as a string slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Extract the inner [`Cow`].
+    #[must_use]
+    pub fn into_inner(self) -> Cow<'static, str> {
+        self.0
+    }
+}
+
+impl AsRef<str> for ZipPath {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ZipPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<&'static str> for ZipPath {
+    type Error = InvalidZipPath;
+
+    fn try_from(path: &'static str) -> Result<Self, Self::Error> {
+        Self::new(path)
+    }
+}
+
+impl TryFrom<String> for ZipPath {
+    type Error = InvalidZipPath;
+
+    fn try_from(path: String) -> Result<Self, Self::Error> {
+        Self::new(path)
+    }
+}
+
+impl TryFrom<Cow<'static, str>> for ZipPath {
+    type Error = InvalidZipPath;
+
+    fn try_from(path: Cow<'static, str>) -> Result<Self, Self::Error> {
+        Self::new(path)
+    }
+}
+
 // ── Compression ──────────────────────────────────────────────────────────────
 
 /// Compression method stored in ZIP file headers.
@@ -141,7 +257,7 @@ pub enum CompressionMethod {
 
 /// Central-directory metadata accumulated as each entry is completed.
 struct CdEntry {
-    path: String,
+    path: ZipPath,
     modified: MsDosDateTime,
     method: CompressionMethod,
     crc32: u32,
@@ -153,7 +269,7 @@ struct CdEntry {
 
 /// Tracks the in-flight file entry whose content is being fed.
 struct ActiveFile {
-    path: String,
+    path: ZipPath,
     modified: MsDosDateTime,
     method: CompressionMethod,
     uncompressed_size: u64,
@@ -216,7 +332,7 @@ impl ZipArchive {
     /// or [`end_file_compressed`](Self::end_file_compressed).
     pub fn start_file(
         &mut self,
-        path: String,
+        path: ZipPath,
         modified: MsDosDateTime,
         method: CompressionMethod,
         buf: &mut BytesMut,
@@ -225,7 +341,7 @@ impl ZipArchive {
 
         let local_offset = self.offset;
         let before = buf.len();
-        encode_local_header(&path, modified, method, buf);
+        encode_local_header(path.as_str(), modified, method, buf);
         self.offset += (buf.len() - before) as u64;
 
         self.active = Some(ActiveFile {
@@ -324,12 +440,12 @@ impl ZipArchive {
     ///
     /// Panics if a previous file was not ended with [`end_file`](Self::end_file)
     /// or [`end_file_compressed`](Self::end_file_compressed).
-    pub fn add_directory(&mut self, path: String, modified: MsDosDateTime, buf: &mut BytesMut) {
+    pub fn add_directory(&mut self, path: ZipPath, modified: MsDosDateTime, buf: &mut BytesMut) {
         assert!(self.active.is_none(), "previous file not ended");
 
         let local_offset = self.offset;
         let before = buf.len();
-        encode_local_header(&path, modified, CompressionMethod::Stored, buf);
+        encode_local_header(path.as_str(), modified, CompressionMethod::Stored, buf);
         encode_data_descriptor(0, 0, 0, buf);
         self.offset += (buf.len() - before) as u64;
 
@@ -385,7 +501,7 @@ impl Default for ZipArchive {
 /// data, and in the central directory's ZIP64 extra field.
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "file names > 64 KiB are unsupported"
+    reason = "ZipPath guarantees the name fits in u16"
 )]
 fn encode_local_header(
     path: &str,
@@ -448,11 +564,11 @@ const CD_EXTRA_LEN: u16 = 28;
 
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "file names > 64 KiB are unsupported"
+    reason = "ZipPath guarantees the name fits in u16"
 )]
 fn encode_cd_entry(e: &CdEntry, b: &mut BytesMut) {
-    let name = e.path.as_bytes();
-    let external_attr: u32 = if e.path.ends_with('/') {
+    let name = e.path.as_str().as_bytes();
+    let external_attr: u32 = if e.path.as_str().ends_with('/') {
         0o40_755 << 16 // S_IFDIR + rwxr-xr-x
     } else {
         0o100_644 << 16 // S_IFREG + rw-r--r--
@@ -609,7 +725,7 @@ mod tests {
             let mut buf = BytesMut::new();
 
             archive.start_file(
-                name.into(),
+                name.try_into().unwrap(),
                 MsDosDateTime::default(),
                 CompressionMethod::Stored,
                 &mut buf,
@@ -703,7 +819,7 @@ mod tests {
 
         let zip = collect_archive(|archive, out| {
             let mut buf = BytesMut::new();
-            archive.add_directory(path.into(), MsDosDateTime::default(), &mut buf);
+            archive.add_directory(path.try_into().unwrap(), MsDosDateTime::default(), &mut buf);
             emit(&mut buf, out);
             archive.finish(&mut buf);
             emit(&mut buf, out);
@@ -744,6 +860,21 @@ mod tests {
     }
 
     #[test]
+    fn zip_path_length_validation() {
+        // Exactly the u16 limit is accepted.
+        assert!(ZipPath::new("a".repeat(65_535)).is_ok());
+
+        // One byte over is rejected and the path can be recovered.
+        let long = "a".repeat(65_536);
+        let err = ZipPath::new(long.clone()).unwrap_err();
+        assert_eq!(err.into_inner(), long);
+
+        // Static strings are stored borrowed - no allocation.
+        let path = ZipPath::new("hello.txt").unwrap();
+        assert!(matches!(path.into_inner(), Cow::Borrowed("hello.txt")));
+    }
+
+    #[test]
     fn ms_dos_date_time_validation() {
         // Extremes of every valid range are accepted.
         assert!(MsDosDateTime::new(1980, 1, 1, 0, 0, 0).is_some());
@@ -777,7 +908,7 @@ mod tests {
             let mut buf = BytesMut::new();
 
             archive.start_file(
-                "a.txt".into(),
+                "a.txt".try_into().unwrap(),
                 MsDosDateTime::default(),
                 CompressionMethod::Stored,
                 &mut buf,
@@ -789,7 +920,7 @@ mod tests {
             emit(&mut buf, out);
 
             archive.start_file(
-                "b.txt".into(),
+                "b.txt".try_into().unwrap(),
                 MsDosDateTime::default(),
                 CompressionMethod::Stored,
                 &mut buf,

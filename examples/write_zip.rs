@@ -17,16 +17,16 @@ async fn main() -> io::Result<()> {
 
     let entries: Vec<io::Result<_>> = vec![
         Ok(ZipEntry::File {
-            path: "hello.txt".into(),
+            path: "hello.txt".try_into().unwrap(),
             modified,
             content: stream::iter([Ok(Bytes::from_static(b"Hello, world!"))]),
         }),
         Ok(ZipEntry::Directory {
-            path: "subdir/".into(),
+            path: "subdir/".try_into().unwrap(),
             modified,
         }),
         Ok(ZipEntry::File {
-            path: "subdir/notes.txt".into(),
+            path: "subdir/notes.txt".try_into().unwrap(),
             modified,
             content: stream::iter([Ok(Bytes::from_static(b"Some notes in a subdir.\n"))]),
         }),

@@ -13,7 +13,7 @@ use std::{
 };
 
 use bytes::BytesMut;
-use cerniera::{CompressionMethod, MsDosDateTime, ZipArchive};
+use cerniera::{CompressionMethod, MsDosDateTime, ZipArchive, ZipPath};
 use flate2::{Compression, write::DeflateEncoder};
 use jiff::Timestamp;
 
@@ -39,6 +39,7 @@ fn main() -> io::Result<()> {
             .try_into()
             .expect("modification time out of MS-DOS range");
 
+        let path = ZipPath::new(path).expect("file name too long");
         archive.start_file(path, modified, CompressionMethod::Deflate, &mut buf);
         out.write_all(&buf)?;
         buf.clear();

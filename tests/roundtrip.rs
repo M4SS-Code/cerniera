@@ -34,7 +34,12 @@ fn single_stored_file() {
     let modified = MsDosDateTime::new(2026, 3, 10, 12, 30, 0).unwrap();
 
     let zip_bytes = build_archive(|archive, buf, out| {
-        archive.start_file("hello.txt".into(), modified, CompressionMethod::Stored, buf);
+        archive.start_file(
+            "hello.txt".try_into().unwrap(),
+            modified,
+            CompressionMethod::Stored,
+            buf,
+        );
         flush(buf, out);
 
         archive.file_data(content);
@@ -62,12 +67,17 @@ fn multiple_files_and_directory() {
 
     let zip_bytes = build_archive(|archive, buf, out| {
         // Directory
-        archive.add_directory("subdir/".into(), modified, buf);
+        archive.add_directory("subdir/".try_into().unwrap(), modified, buf);
         flush(buf, out);
 
         // First file
         let a = b"file a contents";
-        archive.start_file("a.txt".into(), modified, CompressionMethod::Stored, buf);
+        archive.start_file(
+            "a.txt".try_into().unwrap(),
+            modified,
+            CompressionMethod::Stored,
+            buf,
+        );
         flush(buf, out);
         archive.file_data(a);
         out.extend_from_slice(a);
@@ -77,7 +87,7 @@ fn multiple_files_and_directory() {
         // Second file in subdir
         let b = b"file b contents here";
         archive.start_file(
-            "subdir/b.txt".into(),
+            "subdir/b.txt".try_into().unwrap(),
             modified,
             CompressionMethod::Stored,
             buf,
@@ -121,7 +131,7 @@ fn deflate_compressed_file() {
 
     let zip_bytes = build_archive(|archive, buf, out| {
         archive.start_file(
-            "compressed.txt".into(),
+            "compressed.txt".try_into().unwrap(),
             modified,
             CompressionMethod::Deflate,
             buf,
