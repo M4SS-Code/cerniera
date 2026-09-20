@@ -7,10 +7,23 @@ use bytes::{Bytes, BytesMut};
 use futures_core::Stream;
 use pin_project_lite::pin_project;
 
-use crate::archive::{CompressionMethod, FileTimes, ZipArchive, ZipPath};
+use crate::archive::{CompressionMethod, FileTimes, InvalidZipPath, ZipArchive, ZipPath};
 
 /// One entry (file or directory) passed to [`ZipWriter`].
-pub enum ZipEntry<S> {
+///
+/// Entries are created with the fallible constructors
+/// [`file`](Self::file) and [`directory`](Self::directory), which
+/// validate the trailing-slash convention up front: a file path must
+/// not end with `'/'`, a directory path must - extractors classify an
+/// entry by its trailing slash, so a mismatch would produce headers
+/// that disagree.
+pub struct ZipEntry<S> {
+    inner: EntryInner<S>,
+}
+
+/// The kind of a [`ZipEntry`]; created only by the constructors, which
+/// validate the kind/path match before any header is written.
+enum EntryInner<S> {
     /// A file entry.
     File {
         /// Path inside the archive, e.g. `"images/photo.jpg"`.
@@ -20,13 +33,51 @@ pub enum ZipEntry<S> {
         /// Raw byte stream.
         content: S,
     },
-    /// A directory entry. `path` should end with `'/'`.
+    /// A directory entry.
     Directory {
         /// Path inside the archive, e.g. `"subdir/"`.
         path: ZipPath,
         /// Last-modified date and time.
         modified: FileTimes,
     },
+}
+
+impl<S> ZipEntry<S> {
+    /// Create a file entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidZipPath::FileWithTrailingSlash`] when `path`
+    /// ends with `'/'` - that shape names a directory; use
+    /// [`directory`](Self::directory) instead.
+    pub fn file(path: ZipPath, modified: FileTimes, content: S) -> Result<Self, InvalidZipPath> {
+        if path.as_str().ends_with('/') {
+            return Err(InvalidZipPath::FileWithTrailingSlash(path.into_inner()));
+        }
+        Ok(Self {
+            inner: EntryInner::File {
+                path,
+                modified,
+                content,
+            },
+        })
+    }
+
+    /// Create a directory entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidZipPath::DirectoryWithoutSlash`] when `path`
+    /// does not end with `'/'` - extractors classify an entry as a
+    /// directory by its trailing slash.
+    pub fn directory(path: ZipPath, modified: FileTimes) -> Result<Self, InvalidZipPath> {
+        if !path.as_str().ends_with('/') {
+            return Err(InvalidZipPath::DirectoryWithoutSlash(path.into_inner()));
+        }
+        Ok(Self {
+            inner: EntryInner::Directory { path, modified },
+        })
+    }
 }
 
 pin_project! {
@@ -105,21 +156,26 @@ where
 
                 Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
 
-                Poll::Ready(Some(Ok(ZipEntry::File {
-                    path,
-                    modified,
-                    content,
-                }))) => {
-                    this.archive
-                        .start_file(path, modified, CompressionMethod::Stored, this.buf);
-                    this.current_stream.set(Some(content));
-                    Poll::Ready(Some(Ok(this.buf.split().freeze())))
-                }
-
-                Poll::Ready(Some(Ok(ZipEntry::Directory { path, modified }))) => {
-                    this.archive.add_directory(path, modified, this.buf);
-                    Poll::Ready(Some(Ok(this.buf.split().freeze())))
-                }
+                Poll::Ready(Some(Ok(entry))) => match entry.inner {
+                    EntryInner::File {
+                        path,
+                        modified,
+                        content,
+                    } => {
+                        this.archive.start_file(
+                            path,
+                            modified,
+                            CompressionMethod::Stored,
+                            this.buf,
+                        );
+                        this.current_stream.set(Some(content));
+                        Poll::Ready(Some(Ok(this.buf.split().freeze())))
+                    }
+                    EntryInner::Directory { path, modified } => {
+                        this.archive.add_directory(path, modified, this.buf);
+                        Poll::Ready(Some(Ok(this.buf.split().freeze())))
+                    }
+                },
 
                 Poll::Ready(None) => {
                     this.archive.finish(this.buf);

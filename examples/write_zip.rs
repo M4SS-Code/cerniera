@@ -19,20 +19,19 @@ async fn main() -> io::Result<()> {
     );
 
     let entries: Vec<io::Result<_>> = vec![
-        Ok(ZipEntry::File {
-            path: "hello.txt".try_into().unwrap(),
+        Ok(ZipEntry::file(
+            "hello.txt".try_into().unwrap(),
             modified,
-            content: stream::iter([Ok(Bytes::from_static(b"Hello, world!"))]),
-        }),
-        Ok(ZipEntry::Directory {
-            path: "subdir/".try_into().unwrap(),
+            stream::iter([Ok(Bytes::from_static(b"Hello, world!"))]),
+        )
+        .unwrap()),
+        Ok(ZipEntry::directory("subdir/".try_into().unwrap(), modified).unwrap()),
+        Ok(ZipEntry::file(
+            "subdir/notes.txt".try_into().unwrap(),
             modified,
-        }),
-        Ok(ZipEntry::File {
-            path: "subdir/notes.txt".try_into().unwrap(),
-            modified,
-            content: stream::iter([Ok(Bytes::from_static(b"Some notes in a subdir.\n"))]),
-        }),
+            stream::iter([Ok(Bytes::from_static(b"Some notes in a subdir.\n"))]),
+        )
+        .unwrap()),
     ];
 
     let mut zip_stream = pin!(ZipWriter::new(stream::iter(entries)));

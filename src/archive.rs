@@ -212,21 +212,43 @@ impl TryFrom<jiff::Zoned> for FileTimes {
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
 
-/// Error returned when a path does not fit ZIP's 16-bit name length field.
+/// Error returned when a ZIP entry path is rejected: either because it
+/// does not fit the format's 16-bit name length field, or because its
+/// shape does not match the requested entry kind.
 ///
-/// Returned by [`ZipPath::new`]. The rejected path can be recovered with
-/// [`into_inner`](Self::into_inner).
+/// The rejected path can be recovered with [`into_inner`](Self::into_inner).
+/// The enum may grow new rejection reasons: match with a wildcard arm.
 #[derive(Debug, Error)]
-#[error("file name length {} exceeds 65535 bytes", path.len())]
-pub struct InvalidZipPath {
-    path: Cow<'static, str>,
+#[non_exhaustive]
+pub enum InvalidZipPath {
+    /// The path is a valid name but does not fit the format's 16-bit
+    /// name length field.
+    #[error("file name length {} exceeds 65535 bytes", .0.len())]
+    TooLong(Cow<'static, str>),
+    /// The path could escape the extraction directory or break readers
+    /// (see [`ZipPath::new`](ZipPath::new)).
+    #[error("unsafe entry path: {}", .0)]
+    Dangerous(Cow<'static, str>),
+    /// The path ends with `'/'`, which names a directory, but a file
+    /// entry was requested.
+    #[error("file entry path must not end with '/': {}", .0)]
+    FileWithTrailingSlash(Cow<'static, str>),
+    /// The path does not end with `'/'`, but a directory entry was
+    /// requested.
+    #[error("directory entry path must end with '/': {}", .0)]
+    DirectoryWithoutSlash(Cow<'static, str>),
 }
 
 impl InvalidZipPath {
     /// Return the rejected path.
     #[must_use]
     pub fn into_inner(self) -> Cow<'static, str> {
-        self.path
+        match self {
+            Self::TooLong(path)
+            | Self::Dangerous(path)
+            | Self::FileWithTrailingSlash(path)
+            | Self::DirectoryWithoutSlash(path) => path,
+        }
     }
 }
 
@@ -262,7 +284,7 @@ impl ZipPath {
         if u16::try_from(path.len()).is_ok() {
             Ok(Self(path))
         } else {
-            Err(InvalidZipPath { path })
+            Err(InvalidZipPath::TooLong(path))
         }
     }
 
@@ -468,7 +490,9 @@ impl ZipArchive {
     /// # Panics
     ///
     /// Panics if a previous file was not ended with [`end_file`](Self::end_file)
-    /// or [`end_file_compressed`](Self::end_file_compressed).
+    /// or [`end_file_compressed`](Self::end_file_compressed), or if `path`
+    /// ends with `'/'` - use [`add_directory`](Self::add_directory) for
+    /// directories.
     pub fn start_file(
         &mut self,
         path: ZipPath,
@@ -477,6 +501,14 @@ impl ZipArchive {
         buf: &mut BytesMut,
     ) {
         assert!(self.active.is_none(), "previous file not ended");
+        // The trailing-slash convention selects the entry kind: every
+        // extractor keys on it to classify the entry, and the central
+        // directory entry re-derives the kind from the path. A file
+        // path ending in '/' would produce headers that disagree.
+        assert!(
+            !path.as_str().ends_with('/'),
+            "file entry path must not end with '/': {path}"
+        );
 
         let local_offset = self.offset;
         let before = buf.len();
@@ -606,9 +638,15 @@ impl ZipArchive {
     /// # Panics
     ///
     /// Panics if a previous file was not ended with [`end_file`](Self::end_file)
-    /// or [`end_file_compressed`](Self::end_file_compressed).
+    /// or [`end_file_compressed`](Self::end_file_compressed), or if `path`
+    /// does not end with `'/'` - extractors classify an entry as a
+    /// directory by its trailing slash.
     pub fn add_directory(&mut self, path: ZipPath, times: FileTimes, buf: &mut BytesMut) {
         assert!(self.active.is_none(), "previous file not ended");
+        assert!(
+            path.as_str().ends_with('/'),
+            "directory entry path must end with '/': {path}"
+        );
 
         let local_offset = self.offset;
         let before = buf.len();
@@ -1281,6 +1319,27 @@ mod tests {
         );
         archive.file_data(b"data");
         archive.end_file_compressed(4, &mut buf);
+    }
+
+    #[test]
+    #[should_panic(expected = "file entry path must not end with '/'")]
+    fn start_file_rejects_trailing_slash() {
+        let mut archive = ZipArchive::new();
+        let mut buf = BytesMut::new();
+        archive.start_file(
+            "dir/".try_into().unwrap(),
+            FileTimes::default(),
+            CompressionMethod::Stored,
+            &mut buf,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "directory entry path must end with '/'")]
+    fn add_directory_requires_trailing_slash() {
+        let mut archive = ZipArchive::new();
+        let mut buf = BytesMut::new();
+        archive.add_directory("dir".try_into().unwrap(), FileTimes::default(), &mut buf);
     }
 
     // std-only: swapping the panic hook keeps the caught panic out of the

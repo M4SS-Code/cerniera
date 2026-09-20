@@ -28,15 +28,13 @@
 //! );
 //!
 //! let entries = stream::iter([
-//!     Ok(ZipEntry::File {
-//!         path: "hello.txt".try_into().unwrap(),
+//!     Ok(ZipEntry::file(
+//!         "hello.txt".try_into().unwrap(),
 //!         modified,
-//!         content: stream::iter([Ok::<_, io::Error>(Bytes::from_static(b"Hello, world!"))]),
-//!     }),
-//!     Ok(ZipEntry::Directory {
-//!         path: "subdir/".try_into().unwrap(),
-//!         modified,
-//!     }),
+//!         stream::iter([Ok::<_, io::Error>(Bytes::from_static(b"Hello, world!"))]),
+//!     )
+//!     .unwrap()),
+//!     Ok(ZipEntry::directory("subdir/".try_into().unwrap(), modified).unwrap()),
 //! ]);
 //!
 //! let mut zip_stream = pin!(ZipWriter::new(entries));
