@@ -6,6 +6,9 @@ Feed it file content through a `Stream` or write it directly with
 `sendfile`, `mmap`, or any I/O strategy you like - cerniera only
 encodes the ZIP framing around it.
 
+ZIP64 records are written only where needed: entries over 4 GiB and
+archives with more than 65,535 entries are supported.
+
 *Cerniera* (/t∫erˈnjɛra/) is Italian for *zipper*.
 
 ## Quick start
