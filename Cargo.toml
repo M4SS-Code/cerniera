@@ -20,6 +20,7 @@ crc32fast = { version = "1.2", default-features = false }
 futures-core = { version = "0.3", default-features = false }
 jiff = { version = "0.2", default-features = false, optional = true }
 pin-project-lite = "0.2"
+thiserror = { version = "2", default-features = false }
 
 [dev-dependencies]
 flate2 = "1"

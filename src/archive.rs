@@ -3,6 +3,7 @@ use core::fmt;
 
 use bytes::{BufMut, BytesMut};
 use crc32fast::Hasher as Crc32Hasher;
+use thiserror::Error;
 
 // ── Signatures ────────────────────────────────────────────────────────────────
 
@@ -24,17 +25,10 @@ const VERSION_MADE_BY: u16 = (3 << 8) | 0x2D;
 // ── Date / time ──────────────────────────────────────────────────────────────
 
 /// Error returned when [`MsDosDateTime::new`] is given an invalid date or time.
-#[derive(Debug)]
+#[derive(Debug, Error)]
+#[error("invalid MS-DOS date/time")]
 #[non_exhaustive]
 pub struct InvalidMsDosDateTime;
-
-impl fmt::Display for InvalidMsDosDateTime {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid MS-DOS date/time")
-    }
-}
-
-impl core::error::Error for InvalidMsDosDateTime {}
 
 /// MS-DOS date and time as stored in ZIP file headers.
 ///
@@ -123,7 +117,8 @@ impl TryFrom<jiff::civil::DateTime> for MsDosDateTime {
 ///
 /// Returned by [`ZipPath::new`]. The rejected path can be recovered with
 /// [`into_inner`](Self::into_inner).
-#[derive(Debug)]
+#[derive(Debug, Error)]
+#[error("file name length {} exceeds 65535 bytes", path.len())]
 pub struct InvalidZipPath {
     path: Cow<'static, str>,
 }
@@ -135,18 +130,6 @@ impl InvalidZipPath {
         self.path
     }
 }
-
-impl fmt::Display for InvalidZipPath {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "file name length {} exceeds 65535 bytes",
-            self.path.len()
-        )
-    }
-}
-
-impl core::error::Error for InvalidZipPath {}
 
 /// A ZIP entry path, validated to fit the format's 16-bit name length field.
 ///

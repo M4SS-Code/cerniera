@@ -39,6 +39,7 @@ dependencies = [
  "memmap2",
  "pin-project-lite",
  "rustix",
+ "thiserror",
  "tokio",
  "zip",
 ]
