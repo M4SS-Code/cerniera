@@ -7,7 +7,7 @@ use bytes::{Bytes, BytesMut};
 use futures_core::Stream;
 use pin_project_lite::pin_project;
 
-use crate::archive::{CompressionMethod, MsDosDateTime, ZipArchive, ZipPath};
+use crate::archive::{CompressionMethod, FileTimes, ZipArchive, ZipPath};
 
 /// One entry (file or directory) passed to [`ZipWriter`].
 pub enum ZipEntry<S> {
@@ -16,7 +16,7 @@ pub enum ZipEntry<S> {
         /// Path inside the archive, e.g. `"images/photo.jpg"`.
         path: ZipPath,
         /// Last-modified date and time.
-        modified: MsDosDateTime,
+        modified: FileTimes,
         /// Raw byte stream.
         content: S,
     },
@@ -25,7 +25,7 @@ pub enum ZipEntry<S> {
         /// Path inside the archive, e.g. `"subdir/"`.
         path: ZipPath,
         /// Last-modified date and time.
-        modified: MsDosDateTime,
+        modified: FileTimes,
     },
 }
 

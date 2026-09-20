@@ -3,7 +3,7 @@
 use std::io::{Cursor, Read};
 
 use bytes::BytesMut;
-use cerniera::{CompressionMethod, MsDosDateTime, ZipArchive};
+use cerniera::{CompressionMethod, FileTimes, MsDosDateTime, ZipArchive};
 
 /// Helper: collect all `ZipArchive` output into a flat `Vec<u8>`.
 fn build_archive(f: impl FnOnce(&mut ZipArchive, &mut BytesMut, &mut Vec<u8>)) -> Vec<u8> {
@@ -31,7 +31,10 @@ fn empty_archive() {
 #[test]
 fn single_stored_file() {
     let content = b"Hello, cerniera!";
-    let modified = MsDosDateTime::new(2026, 3, 10, 12, 30, 0).unwrap();
+    let modified = FileTimes::new(
+        MsDosDateTime::new(2026, 3, 10, 12, 30, 0).unwrap(),
+        1_773_145_800,
+    );
 
     let zip_bytes = build_archive(|archive, buf, out| {
         archive.start_file(
@@ -59,11 +62,18 @@ fn single_stored_file() {
     let mut read_back = Vec::new();
     file.read_to_end(&mut read_back).unwrap();
     assert_eq!(read_back, content);
+
+    // The Unix timestamp round-trips as an extended timestamp extra field.
+    assert!(
+        file.extra_data_fields()
+            .any(|f| matches!(f, zip::extra_fields::ExtraField::ExtendedTimestamp(_))),
+        "expected an extended timestamp extra field"
+    );
 }
 
 #[test]
 fn multiple_files_and_directory() {
-    let modified = MsDosDateTime::new(2026, 3, 10, 14, 0, 0).unwrap();
+    let modified = FileTimes::dos_only(MsDosDateTime::new(2026, 3, 10, 14, 0, 0).unwrap());
 
     let zip_bytes = build_archive(|archive, buf, out| {
         // Directory
@@ -127,7 +137,7 @@ fn deflate_compressed_file() {
     use std::io::Write;
 
     let content = b"the quick brown fox jumps over the lazy dog, again and again and again";
-    let modified = MsDosDateTime::new(2026, 3, 10, 16, 0, 0).unwrap();
+    let modified = FileTimes::dos_only(MsDosDateTime::new(2026, 3, 10, 16, 0, 0).unwrap());
 
     let zip_bytes = build_archive(|archive, buf, out| {
         archive.start_file(

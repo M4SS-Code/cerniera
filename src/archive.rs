@@ -16,6 +16,8 @@ const SIG_EOCD: u32 = 0x0605_4b50;
 
 // ZIP64 extra-field block tag.
 const TAG_ZIP64: u16 = 0x0001;
+// Extended timestamp extra field tag (Unix modification time).
+const TAG_EXTENDED_TIMESTAMP: u16 = 0x5455;
 
 // version needed to extract for entries using ZIP64 (APPNOTE §4.4.3.2)
 const VERSION_ZIP64: u16 = 45;
@@ -112,6 +114,99 @@ impl TryFrom<jiff::civil::DateTime> for MsDosDateTime {
         let minute: u16 = dt.minute().try_into().map_err(|_| InvalidMsDosDateTime)?;
         let second: u16 = dt.second().try_into().map_err(|_| InvalidMsDosDateTime)?;
         Self::new(year, month, day, hour, minute, second).ok_or(InvalidMsDosDateTime)
+    }
+}
+
+// ── File times ───────────────────────────────────────────────────────────────
+
+/// File timestamps in the two forms a ZIP entry can carry.
+///
+/// The MS-DOS date/time is always written into the local and central
+/// directory headers. The optional Unix timestamp is written as an
+/// extended timestamp (0x5455) extra field when present; extractors that
+/// support it prefer it over the MS-DOS fields.
+///
+/// The two fields should refer to the same instant: the MS-DOS field is a
+/// local-time encoding with 2-second resolution, the Unix field is
+/// seconds since 1970-01-01 UTC.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FileTimes {
+    /// MS-DOS date and time; always written.
+    dos: MsDosDateTime,
+    /// Unix timestamp in seconds; written as a 0x5455 extra field when
+    /// `Some`. The field is 32 bits wide, so the range is 1970 .. 2106:
+    /// the widest the ZIP format allows (it has no wider time field),
+    /// and it spans the MS-DOS range. Keep it consistent with `dos`
+    /// (above) - Info-ZIP unzip discards the extra field when the DOS
+    /// date is below 2038-01-18.
+    unix: Option<u32>,
+}
+
+impl FileTimes {
+    /// Timestamps with an MS-DOS date/time and no Unix timestamp.
+    #[must_use]
+    pub const fn dos_only(dos: MsDosDateTime) -> Self {
+        Self { dos, unix: None }
+    }
+
+    /// Timestamps with both representations.
+    #[must_use]
+    pub const fn new(dos: MsDosDateTime, unix: u32) -> Self {
+        Self {
+            dos,
+            unix: Some(unix),
+        }
+    }
+
+    /// The MS-DOS date and time; always written into the headers.
+    #[must_use]
+    pub const fn dos(&self) -> MsDosDateTime {
+        self.dos
+    }
+
+    /// The Unix timestamp, if present; written as a 0x5455 extra field.
+    #[must_use]
+    pub const fn unix(&self) -> Option<u32> {
+        self.unix
+    }
+}
+
+impl From<MsDosDateTime> for FileTimes {
+    fn from(dos: MsDosDateTime) -> Self {
+        Self::dos_only(dos)
+    }
+}
+
+/// Error returned when a [`FileTimes`] cannot be built from a
+/// timestamp: one of its two representations does not fit the fields a
+/// ZIP entry has for it.
+///
+/// The enum may grow new rejection reasons: match with a wildcard arm.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum InvalidFileTimes {
+    /// The civil date/time does not fit the MS-DOS date/time fields,
+    /// which span 1980-01-01 .. 2107-12-31.
+    #[error(transparent)]
+    MsDosDateTime(#[from] InvalidMsDosDateTime),
+    /// The instant does not fit the 32-bit Unix field (0x5455 extended
+    /// timestamp extra), which spans 1970-01-01 .. 2106-02-07.
+    #[error("Unix timestamp out of range (1970 .. 2106)")]
+    UnixTime,
+}
+
+#[cfg(feature = "jiff")]
+impl TryFrom<jiff::Zoned> for FileTimes {
+    type Error = InvalidFileTimes;
+
+    fn try_from(dt: jiff::Zoned) -> Result<Self, Self::Error> {
+        // `u32` rejects instants outside 1970 .. 2106; the civil
+        // datetime is taken in the zone, which is what the MS-DOS
+        // fields expect.
+        let unix =
+            u32::try_from(dt.timestamp().as_second()).map_err(|_| InvalidFileTimes::UnixTime)?;
+        let dos = dt.datetime().try_into()?;
+        Ok(Self::new(dos, unix))
     }
 }
 
@@ -258,7 +353,7 @@ const fn method_version_needed(method: CompressionMethod) -> u16 {
 /// Central-directory metadata accumulated as each entry is completed.
 struct CdEntry {
     path: ZipPath,
-    modified: MsDosDateTime,
+    times: FileTimes,
     method: CompressionMethod,
     crc32: u32,
     compressed_size: u64,
@@ -270,7 +365,7 @@ struct CdEntry {
 /// Tracks the in-flight file entry whose content is being fed.
 struct ActiveFile {
     path: ZipPath,
-    modified: MsDosDateTime,
+    times: FileTimes,
     method: CompressionMethod,
     uncompressed_size: u64,
     local_offset: u64,
@@ -377,7 +472,7 @@ impl ZipArchive {
     pub fn start_file(
         &mut self,
         path: ZipPath,
-        modified: MsDosDateTime,
+        times: FileTimes,
         method: CompressionMethod,
         buf: &mut BytesMut,
     ) {
@@ -385,12 +480,12 @@ impl ZipArchive {
 
         let local_offset = self.offset;
         let before = buf.len();
-        encode_local_header(path.as_str(), modified, method, EntryKind::File, buf);
+        encode_local_header(path.as_str(), times, method, EntryKind::File, buf);
         self.offset += (buf.len() - before) as u64;
 
         self.active = Some(ActiveFile {
             path,
-            modified,
+            times,
             method,
             uncompressed_size: 0,
             local_offset,
@@ -452,7 +547,7 @@ impl ZipArchive {
 
         self.cd.push(CdEntry {
             path: active.path,
-            modified: active.modified,
+            times: active.times,
             method: active.method,
             crc32,
             compressed_size: size,
@@ -494,7 +589,7 @@ impl ZipArchive {
 
         self.cd.push(CdEntry {
             path: active.path,
-            modified: active.modified,
+            times: active.times,
             method: active.method,
             crc32,
             compressed_size,
@@ -512,14 +607,14 @@ impl ZipArchive {
     ///
     /// Panics if a previous file was not ended with [`end_file`](Self::end_file)
     /// or [`end_file_compressed`](Self::end_file_compressed).
-    pub fn add_directory(&mut self, path: ZipPath, modified: MsDosDateTime, buf: &mut BytesMut) {
+    pub fn add_directory(&mut self, path: ZipPath, times: FileTimes, buf: &mut BytesMut) {
         assert!(self.active.is_none(), "previous file not ended");
 
         let local_offset = self.offset;
         let before = buf.len();
         encode_local_header(
             path.as_str(),
-            modified,
+            times,
             CompressionMethod::Stored,
             EntryKind::Directory,
             buf,
@@ -528,7 +623,7 @@ impl ZipArchive {
 
         self.cd.push(CdEntry {
             path,
-            modified,
+            times,
             method: CompressionMethod::Stored,
             crc32: 0,
             compressed_size: 0,
@@ -593,26 +688,34 @@ impl Default for ZipArchive {
 )]
 fn encode_local_header(
     path: &str,
-    modified: MsDosDateTime,
+    times: FileTimes,
     method: CompressionMethod,
     kind: EntryKind,
     b: &mut BytesMut,
 ) {
     let name = path.as_bytes();
-    b.reserve(30 + name.len());
+    let ut_len: u16 = if times.unix().is_some() {
+        9 // extended timestamp extra field
+    } else {
+        0
+    };
+    b.reserve(30 + name.len() + usize::from(ut_len));
 
     b.put_u32_le(SIG_LOCAL);
     b.put_u16_le(kind.local_version(method));
     b.put_u16_le(kind.gp_flag());
     b.put_u16_le(method as u16);
-    b.put_u16_le(modified.time);
-    b.put_u16_le(modified.date);
+    b.put_u16_le(times.dos().time);
+    b.put_u16_le(times.dos().date);
     b.put_u32_le(0); // CRC-32          ─┐ all deferred to
     b.put_u32_le(0); // compressed size  │ the ZIP64 data
     b.put_u32_le(0); // original size   ─┘ descriptor
     b.put_u16_le(name.len() as u16);
-    b.put_u16_le(0); // extra field length
+    b.put_u16_le(ut_len);
     b.put_slice(name);
+    if let Some(unix) = times.unix() {
+        encode_extended_timestamp_extra(unix, b);
+    }
 }
 
 /// Data descriptor: 16 bytes, or 24 bytes for entries of 4 GiB or larger.
@@ -644,8 +747,19 @@ fn encode_data_descriptor(
     }
 }
 
+/// Extended timestamp extra field (tag 0x5455) carrying the Unix
+/// modification time: `tag(2) + size(2) + flags(1) + mtime(4)`.
+fn encode_extended_timestamp_extra(unix_mtime: u32, b: &mut BytesMut) {
+    b.reserve(9);
+    b.put_u16_le(TAG_EXTENDED_TIMESTAMP);
+    b.put_u16_le(5); // flags byte + mtime
+    b.put_u8(1); // flags: modification time present
+    b.put_u32_le(unix_mtime);
+}
+
 /// Central directory file header: 46 bytes fixed + `name.len()`, plus a
-/// ZIP64 extra field when a 32-bit size/offset field does not fit.
+/// ZIP64 extra field when a 32-bit size/offset field does not fit and an
+/// extended timestamp extra field when a Unix timestamp is present.
 ///
 /// The 32-bit fields carry the real values whenever they fit; a field
 /// that does not fit - or that would carry the sentinel value itself -
@@ -673,11 +787,17 @@ fn encode_cd_entry(e: &CdEntry, b: &mut BytesMut) {
     let zip64_fields = u8::from(compressed.is_none())
         + u8::from(uncompressed.is_none())
         + u8::from(offset.is_none());
-    let extra_len: u16 = if zip64_fields == 0 {
+    let zip64_extra_len: u16 = if zip64_fields == 0 {
         0
     } else {
         u16::from(4 + 8 * zip64_fields)
     };
+    let ut_len: u16 = if e.times.unix().is_some() {
+        9 // extended timestamp extra field
+    } else {
+        0
+    };
+    let extra_len = zip64_extra_len + ut_len;
 
     b.reserve(46 + name.len() + usize::from(extra_len));
 
@@ -699,8 +819,8 @@ fn encode_cd_entry(e: &CdEntry, b: &mut BytesMut) {
     b.put_u16_le(version);
     b.put_u16_le(kind.gp_flag());
     b.put_u16_le(e.method as u16);
-    b.put_u16_le(e.modified.time);
-    b.put_u16_le(e.modified.date);
+    b.put_u16_le(e.times.dos().time);
+    b.put_u16_le(e.times.dos().date);
     b.put_u32_le(e.crc32);
     b.put_u32_le(compressed.unwrap_or(u32::MAX));
     b.put_u32_le(uncompressed.unwrap_or(u32::MAX));
@@ -727,6 +847,10 @@ fn encode_cd_entry(e: &CdEntry, b: &mut BytesMut) {
         if offset.is_none() {
             b.put_u64_le(e.local_offset);
         }
+    }
+
+    if let Some(unix) = e.times.unix() {
+        encode_extended_timestamp_extra(unix, b);
     }
 }
 
@@ -876,7 +1000,7 @@ mod tests {
 
             archive.start_file(
                 name.try_into().unwrap(),
-                MsDosDateTime::default(),
+                FileTimes::default(),
                 CompressionMethod::Stored,
                 &mut buf,
             );
@@ -961,7 +1085,7 @@ mod tests {
         // field; the other 32-bit fields hold real values.
         let mut entry = CdEntry {
             path: name.try_into().unwrap(),
-            modified: MsDosDateTime::default(),
+            times: FileTimes::default(),
             method: CompressionMethod::Stored,
             crc32: 0,
             compressed_size: u64::from(u32::MAX) + 1,
@@ -1020,6 +1144,47 @@ mod tests {
     }
 
     #[test]
+    fn ut_extra_in_local_and_central_headers() {
+        // A Unix timestamp is carried as a 0x5455 extra in both headers.
+        let unix: u32 = 0x64F1_2B3C;
+        let times = FileTimes::new(MsDosDateTime::default(), unix);
+
+        let zip = collect_archive(|archive, out| {
+            let mut buf = BytesMut::new();
+            archive.start_file(
+                "a.txt".try_into().unwrap(),
+                times,
+                CompressionMethod::Stored,
+                &mut buf,
+            );
+            emit(&mut buf, out);
+            archive.file_data(b"data");
+            out.extend_from_slice(b"data");
+            archive.end_file(&mut buf);
+            emit(&mut buf, out);
+            archive.finish(&mut buf);
+            emit(&mut buf, out);
+        });
+
+        // Local header: 9-byte extra after the 5-byte name.
+        assert_eq!(u16le(&zip, 28), 9, "local extra length");
+        let ut = 30 + 5;
+        assert_eq!(u16le(&zip, ut), TAG_EXTENDED_TIMESTAMP);
+        assert_eq!(u16le(&zip, ut + 2), 5, "flags + mtime");
+        assert_eq!(zip[ut + 4], 1, "mtime flag");
+        assert_eq!(u32le(&zip, ut + 5), unix);
+
+        // Central directory: same extra, no ZIP64 extra.
+        let eocd = zip.len() - 22;
+        let cd = u32le(&zip, eocd + 16) as usize;
+        assert_eq!(u16le(&zip, cd + 30), 9, "cd extra length");
+        let cut = cd + 46 + 5;
+        assert_eq!(u16le(&zip, cut), TAG_EXTENDED_TIMESTAMP);
+        assert_eq!(u16le(&zip, cut + 2), 5, "flags + mtime");
+        assert_eq!(u32le(&zip, cut + 5), unix);
+    }
+
+    #[test]
     fn version_needed_by_method() {
         // Method minimums (APPNOTE §4.4.3.2).
         assert_eq!(method_version_needed(CompressionMethod::Stored), 20);
@@ -1035,7 +1200,7 @@ mod tests {
             let mut buf = BytesMut::new();
             archive.start_file(
                 "a.bin".try_into().unwrap(),
-                MsDosDateTime::default(),
+                FileTimes::default(),
                 CompressionMethod::Bzip2,
                 &mut buf,
             );
@@ -1065,7 +1230,7 @@ mod tests {
 
         let zip = collect_archive(|archive, out| {
             let mut buf = BytesMut::new();
-            archive.add_directory(path.try_into().unwrap(), MsDosDateTime::default(), &mut buf);
+            archive.add_directory(path.try_into().unwrap(), FileTimes::default(), &mut buf);
             emit(&mut buf, out);
             archive.finish(&mut buf);
             emit(&mut buf, out);
@@ -1095,7 +1260,7 @@ mod tests {
         let mut buf = BytesMut::new();
         archive.start_file(
             "a.txt".try_into().unwrap(),
-            MsDosDateTime::default(),
+            FileTimes::default(),
             CompressionMethod::Deflate,
             &mut buf,
         );
@@ -1110,7 +1275,7 @@ mod tests {
         let mut buf = BytesMut::new();
         archive.start_file(
             "a.txt".try_into().unwrap(),
-            MsDosDateTime::default(),
+            FileTimes::default(),
             CompressionMethod::Stored,
             &mut buf,
         );
@@ -1133,7 +1298,7 @@ mod tests {
         let mut buf = BytesMut::new();
         archive.start_file(
             "a.txt".try_into().unwrap(),
-            MsDosDateTime::default(),
+            FileTimes::default(),
             CompressionMethod::Deflate,
             &mut buf,
         );
@@ -1240,6 +1405,59 @@ mod tests {
         assert!(MsDosDateTime::new(2100, 2, 29, 0, 0, 0).is_none());
     }
 
+    #[cfg(feature = "jiff")]
+    #[test]
+    fn file_times_from_zoned() {
+        // A fixed UTC zone: the civil datetime is the UTC datetime.
+
+        // An instant inside both field ranges keeps both representations.
+        let zoned = jiff::Timestamp::new(1_773_145_800, 0)
+            .unwrap()
+            .to_zoned(jiff::tz::TimeZone::UTC);
+        let times = FileTimes::try_from(zoned).unwrap();
+        // MsDosDateTime has no PartialEq; compare the packed fields.
+        let expected = MsDosDateTime::new(2026, 3, 10, 12, 30, 0).unwrap();
+        assert_eq!(
+            (times.dos().time, times.dos().date),
+            (expected.time, expected.date)
+        );
+        assert_eq!(times.unix(), Some(1_773_145_800));
+
+        // The widest representable instant: the 32-bit field maxes out at
+        // 2106-02-07 06:28:15 UTC, still a valid MS-DOS date.
+        let zoned = jiff::Timestamp::new(i64::from(u32::MAX), 0)
+            .unwrap()
+            .to_zoned(jiff::tz::TimeZone::UTC);
+        assert!(FileTimes::try_from(zoned).is_ok());
+
+        // One second later the Unix field overflows even though the
+        // MS-DOS date (2106) still fits: the failure is the Unix
+        // field's.
+        let zoned = jiff::Timestamp::new(i64::from(u32::MAX) + 1, 0)
+            .unwrap()
+            .to_zoned(jiff::tz::TimeZone::UTC);
+        assert!(matches!(
+            FileTimes::try_from(zoned),
+            Err(InvalidFileTimes::UnixTime)
+        ));
+    }
+
+    #[cfg(feature = "jiff")]
+    #[test]
+    fn file_times_from_zoned_out_of_dos_range() {
+        // 1975: a valid 32-bit Unix timestamp, but a year the MS-DOS
+        // fields cannot encode (they start at 1980): the failure is the
+        // DOS field's, not the Unix field's.
+        let zoned = jiff::civil::DateTime::new(1975, 6, 15, 0, 0, 0, 0)
+            .unwrap()
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .unwrap();
+        assert!(matches!(
+            FileTimes::try_from(zoned),
+            Err(InvalidFileTimes::MsDosDateTime(_))
+        ));
+    }
+
     #[test]
     fn multiple_entries_offsets() {
         let a_data = b"aaaa";
@@ -1250,7 +1468,7 @@ mod tests {
 
             archive.start_file(
                 "a.txt".try_into().unwrap(),
-                MsDosDateTime::default(),
+                FileTimes::default(),
                 CompressionMethod::Stored,
                 &mut buf,
             );
@@ -1262,7 +1480,7 @@ mod tests {
 
             archive.start_file(
                 "b.txt".try_into().unwrap(),
-                MsDosDateTime::default(),
+                FileTimes::default(),
                 CompressionMethod::Stored,
                 &mut buf,
             );

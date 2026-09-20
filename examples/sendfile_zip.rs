@@ -7,7 +7,7 @@
 use std::{env, fs::File, io, io::Write, process};
 
 use bytes::BytesMut;
-use cerniera::{CompressionMethod, MsDosDateTime, ZipArchive, ZipPath};
+use cerniera::{CompressionMethod, FileTimes, ZipArchive, ZipPath};
 use jiff::{Timestamp, tz::TimeZone};
 use memmap2::Mmap;
 
@@ -27,15 +27,13 @@ fn main() -> io::Result<()> {
         let metadata = src.metadata()?;
         let len = metadata.len();
 
-        let modified: MsDosDateTime = Timestamp::try_from(metadata.modified()?)
+        let zoned = Timestamp::try_from(metadata.modified()?)
             .expect("modification time out of range")
-            .to_zoned(TimeZone::system())
-            .datetime()
-            .try_into()
-            .expect("modification time out of MS-DOS range");
+            .to_zoned(TimeZone::system());
+        let times = FileTimes::try_from(zoned).expect("modification time out of range");
 
         let path = ZipPath::new(path).expect("file name too long");
-        archive.start_file(path, modified, CompressionMethod::Stored, &mut buf);
+        archive.start_file(path, times, CompressionMethod::Stored, &mut buf);
         out.write_all(&buf)?;
         buf.clear();
 

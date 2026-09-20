@@ -16,13 +16,16 @@
 //! use std::{io, pin::pin};
 //!
 //! use bytes::Bytes;
-//! use cerniera::{MsDosDateTime, ZipEntry, ZipWriter};
+//! use cerniera::{FileTimes, MsDosDateTime, ZipEntry, ZipWriter};
 //! use futures_util::{TryStreamExt, stream};
 //! use tokio::{fs::File, io::AsyncWriteExt};
 //!
 //! # #[tokio::main(flavor = "current_thread")]
 //! # async fn main() -> io::Result<()> {
-//! let modified = MsDosDateTime::new(2026, 3, 10, 12, 30, 0).unwrap();
+//! let modified = FileTimes::new(
+//!     MsDosDateTime::new(2026, 3, 10, 12, 30, 0).unwrap(),
+//!     1_773_145_800, // same instant, seconds since 1970-01-01 UTC
+//! );
 //!
 //! let entries = stream::iter([
 //!     Ok(ZipEntry::File {
@@ -60,7 +63,8 @@
 //! # Features
 //!
 //! - **`std`** *(default)* - enables runtime SIMD detection for faster CRC-32.
-//! - **`jiff`** - adds `TryFrom<jiff::civil::DateTime>` for [`MsDosDateTime`].
+//! - **`jiff`** - adds `TryFrom<jiff::civil::DateTime>` for [`MsDosDateTime`]
+//!   and `TryFrom<jiff::Zoned>` for [`FileTimes`].
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -69,7 +73,10 @@ extern crate alloc;
 pub mod archive;
 mod stream;
 
-pub use self::archive::{
-    CompressionMethod, InvalidMsDosDateTime, InvalidZipPath, MsDosDateTime, ZipArchive, ZipPath,
+pub use self::{
+    archive::{
+        CompressionMethod, FileTimes, InvalidFileTimes, InvalidMsDosDateTime, InvalidZipPath,
+        MsDosDateTime, ZipArchive, ZipPath,
+    },
+    stream::{ZipEntry, ZipWriter},
 };
-pub use self::stream::{ZipEntry, ZipWriter};

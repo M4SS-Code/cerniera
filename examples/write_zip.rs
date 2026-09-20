@@ -7,13 +7,16 @@
 use std::{io, pin::pin};
 
 use bytes::Bytes;
-use cerniera::{MsDosDateTime, ZipEntry, ZipWriter};
+use cerniera::{FileTimes, MsDosDateTime, ZipEntry, ZipWriter};
 use futures_util::{TryStreamExt, stream};
 use tokio::{fs::File, io::AsyncWriteExt};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> io::Result<()> {
-    let modified = MsDosDateTime::new(2026, 3, 10, 12, 30, 0).unwrap();
+    let modified = FileTimes::new(
+        MsDosDateTime::new(2026, 3, 10, 12, 30, 0).unwrap(),
+        1_773_145_800, // same instant, seconds since 1970-01-01 UTC
+    );
 
     let entries: Vec<io::Result<_>> = vec![
         Ok(ZipEntry::File {
