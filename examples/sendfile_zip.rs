@@ -40,7 +40,13 @@ fn main() -> io::Result<()> {
         // Compute CRC from the memory-mapped region.
 
         {
-            // SAFETY: the file is open and not modified while mapped.
+            // SAFETY: the file must remain unmodified by any other
+            // process (or via any other path) for the duration of the
+            // mapping - opening it read-only does not guarantee that,
+            // and a writer that truncates it would make parts of the
+            // mapping unreadable. If the file changes between this CRC
+            // pass and the sendfile below, the stored CRC will not
+            // match the bytes actually sent.
             #[expect(unsafe_code, reason = "mmap requires unsafe")]
             let mmap = unsafe { Mmap::map(&src)? };
             archive.file_data(&mmap);
