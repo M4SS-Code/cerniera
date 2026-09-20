@@ -468,8 +468,13 @@ impl ZipArchive {
         });
     }
 
-    /// Encode the central directory, ZIP64 EOCD, locator, and standard EOCD
-    /// into `buf`. This finalizes the archive.
+    /// Encode the central directory and the end-of-central-directory
+    /// trailer into `buf`. This finalizes the archive.
+    ///
+    /// A ZIP64 end-of-central-directory record and locator are written only
+    /// when the standard EOCD's 16/32-bit fields cannot represent the
+    /// archive (APPNOTE §4.4.22-4.4.24); otherwise the archive ends with
+    /// the plain 22-byte EOCD.
     ///
     /// # Panics
     ///
@@ -487,10 +492,16 @@ impl ZipArchive {
         let cd_size = (buf.len() - before) as u64;
         self.offset += cd_size;
 
-        let zip64_eocd_offset = self.offset;
-        encode_zip64_eocd(self.cd.len() as u64, cd_size, cd_start, buf);
-        encode_zip64_eocd_locator(zip64_eocd_offset, buf);
-        encode_eocd(buf);
+        let entries = self.cd.len() as u64;
+        // The standard EOCD only has 16/32-bit fields; a ZIP64 EOCD is
+        // required once any of them would not fit - or would carry a
+        // sentinel value of its own (APPNOTE §4.4.22-4.4.24).
+        if requires_zip64_eocd(entries, cd_size, cd_start) {
+            let zip64_eocd_offset = self.offset;
+            encode_zip64_eocd(entries, cd_size, cd_start, buf);
+            encode_zip64_eocd_locator(zip64_eocd_offset, buf);
+        }
+        encode_eocd(entries, cd_size, cd_start, buf);
     }
 }
 
@@ -641,18 +652,35 @@ fn encode_zip64_eocd_locator(zip64_eocd_offset: u64, b: &mut BytesMut) {
 
 /// Standard EOCD (22 bytes).
 ///
-/// All fields carry sentinel values so that extractors are forced to use
-/// the ZIP64 EOCD instead.
-fn encode_eocd(b: &mut BytesMut) {
+/// `num_entries`, `cd_size`, and `cd_offset` are written as real values
+/// while they fit the 16/32-bit fields; a field that does not fit - or
+/// that would carry the sentinel value itself - is written as a
+/// `0xFFFF` / `0xFFFF_FFFF` sentinel and must be backed by a
+/// ZIP64 EOCD (APPNOTE §4.4.21-4.4.24). The disk-number fields are 0:
+/// cerniera writes single-volume archives, and readers consult the ZIP64
+/// EOCD based on the count/size/offset sentinels and the locator, not on
+/// the disk-number fields.
+fn encode_eocd(num_entries: u64, cd_size: u64, cd_offset: u64, b: &mut BytesMut) {
     b.reserve(22);
     b.put_u32_le(SIG_EOCD);
-    b.put_u16_le(0xFFFF); // disk number            ─┐
-    b.put_u16_le(0xFFFF); // disk where CD starts    │
-    b.put_u16_le(0xFFFF); // entries on this disk     │ all sentinels:
-    b.put_u16_le(0xFFFF); // total entries            │ see ZIP64 EOCD
-    b.put_u32_le(0xFFFF_FFFF); // CD size             │
-    b.put_u32_le(0xFFFF_FFFF); // CD offset          ─┘
+    b.put_u16_le(0); // disk number
+    b.put_u16_le(0); // disk where CD starts
+    b.put_u16_le(u16::try_from(num_entries).unwrap_or(0xFFFF)); // entries on this disk
+    b.put_u16_le(u16::try_from(num_entries).unwrap_or(0xFFFF)); // total entries
+    b.put_u32_le(u32::try_from(cd_size).unwrap_or(u32::MAX)); // CD size
+    b.put_u32_le(u32::try_from(cd_offset).unwrap_or(u32::MAX)); // CD offset
     b.put_u16_le(0); // ZIP comment length
+}
+
+/// Whether the standard EOCD's 16/32-bit fields cannot represent the
+/// archive, so that a ZIP64 EOCD record is required (APPNOTE
+/// §4.4.22-4.4.24). Fields equal to the sentinels (0xFFFF entries,
+/// `0xFFFF_FFFF` size/offset) also require the record: a real value
+/// published there is indistinguishable from the sentinel.
+fn requires_zip64_eocd(num_entries: u64, cd_size: u64, cd_offset: u64) -> bool {
+    num_entries >= u64::from(u16::MAX)
+        || cd_size >= u64::from(u32::MAX)
+        || cd_offset >= u64::from(u32::MAX)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -693,8 +721,8 @@ mod tests {
     //  Local header  = 30 + name_len        (no extra field)
     //  Data descr.   = 16                  (sig+crc+comp_size+orig_size; 24 if ≥ 4 GiB)
     //  CD entry      = 46 + name_len + 28  (ZIP64 extra: tag+len+orig+comp+off)
-    //  ZIP64 EOCD    = 56
-    //  ZIP64 locator = 20
+    //  ZIP64 EOCD    = 56  (only when the plain EOCD fields overflow)
+    //  ZIP64 locator = 20  (same)
     //  Standard EOCD = 22
 
     #[test]
@@ -705,23 +733,17 @@ mod tests {
             emit(&mut buf, out);
         });
 
-        // No entries → offset stays at 0. Trailer = 56 + 20 + 22 = 98 bytes.
-        assert_eq!(zip.len(), 98);
-
-        // ZIP64 EOCD at byte 0
-        assert_eq!(u32le(&zip, 0), SIG_ZIP64_EOCD, "zip64 eocd sig");
-        assert_eq!(u64le(&zip, 24), 0u64, "entries on disk");
-        assert_eq!(u64le(&zip, 32), 0u64, "total entries");
-        assert_eq!(u64le(&zip, 40), 0u64, "cd size");
-        assert_eq!(u64le(&zip, 48), 0u64, "cd offset");
-
-        // ZIP64 EOCD locator at byte 56
-        assert_eq!(u32le(&zip, 56), SIG_ZIP64_EOCD_LOC, "locator sig");
-        assert_eq!(u64le(&zip, 56 + 8), 0u64, "zip64 eocd at offset 0");
-
-        // Standard EOCD at byte 76
-        assert_eq!(u32le(&zip, 76), SIG_EOCD, "std eocd sig");
-        assert_eq!(zip.len(), 98);
+        // No entries and no field overflows 32 bits → plain 22-byte EOCD,
+        // no ZIP64 trailer.
+        assert_eq!(zip.len(), 22);
+        assert_eq!(u32le(&zip, 0), SIG_EOCD, "std eocd sig");
+        assert_eq!(u16le(&zip, 4), 0, "disk number");
+        assert_eq!(u16le(&zip, 6), 0, "disk where CD starts");
+        assert_eq!(u16le(&zip, 8), 0, "entries on disk");
+        assert_eq!(u16le(&zip, 10), 0, "total entries");
+        assert_eq!(u32le(&zip, 12), 0, "cd size");
+        assert_eq!(u32le(&zip, 16), 0, "cd offset");
+        assert_eq!(u16le(&zip, 20), 0, "comment length");
     }
 
     #[test]
@@ -802,22 +824,15 @@ mod tests {
         );
         assert_eq!(u64le(&zip, cex + 20), 0u64, "local offset = 0");
 
-        // ── ZIP64 EOCD ────────────────────────────────────────────────────
-        let cd_entry_size = 46 + cd_name_len + cd_extra_len;
-        let z64 = cd + cd_entry_size;
-        assert_eq!(u32le(&zip, z64), SIG_ZIP64_EOCD);
-        assert_eq!(u64le(&zip, z64 + 24), 1u64, "one entry");
-        assert_eq!(u64le(&zip, z64 + 40), cd_entry_size as u64, "cd size");
-        assert_eq!(u64le(&zip, z64 + 48), cd as u64, "cd offset");
-
-        // ── ZIP64 locator ─────────────────────────────────────────────────
-        let loc = z64 + 56;
-        assert_eq!(u32le(&zip, loc), SIG_ZIP64_EOCD_LOC);
-        assert_eq!(u64le(&zip, loc + 8), z64 as u64, "zip64 eocd offset");
-
         // ── Standard EOCD ─────────────────────────────────────────────────
-        let eocd = loc + 20;
+        // Small archive: the plain EOCD carries the real values and no
+        // ZIP64 trailer is present.
+        let cd_entry_size = 46 + cd_name_len + cd_extra_len;
+        let eocd = cd + cd_entry_size;
         assert_eq!(u32le(&zip, eocd), SIG_EOCD);
+        assert_eq!(u16le(&zip, eocd + 10), 1, "total entries");
+        assert_eq!(u32le(&zip, eocd + 12), cd_entry_size as u32, "cd size");
+        assert_eq!(u32le(&zip, eocd + 16), cd as u32, "cd offset");
         assert_eq!(zip.len(), eocd + 22);
     }
 
@@ -911,6 +926,22 @@ mod tests {
         let cd = 30 + 5 + 16;
         assert_eq!(u32le(&buf, cd), SIG_CENTRAL);
         assert_eq!(&buf[cd + 46..cd + 51], b"a.txt");
+    }
+
+    #[test]
+    fn zip64_eocd_trigger_at_sentinel_values() {
+        // Just below the sentinels → the plain EOCD carries real values.
+        assert!(!requires_zip64_eocd(
+            u64::from(u16::MAX) - 1,
+            u64::from(u32::MAX) - 1,
+            u64::from(u32::MAX) - 1
+        ));
+        // At the sentinels → the ZIP64 EOCD records back the fields,
+        // since a real 0xFFFF / 0xFFFF_FFFF is indistinguishable from
+        // the sentinel.
+        assert!(requires_zip64_eocd(u64::from(u16::MAX), 0, 0));
+        assert!(requires_zip64_eocd(0, u64::from(u32::MAX), 0));
+        assert!(requires_zip64_eocd(0, 0, u64::from(u32::MAX)));
     }
 
     #[test]
@@ -1019,11 +1050,11 @@ mod tests {
         let local_b = (30 + name_len_a + 4 + 16) as u64;
         assert_eq!(u32le(&zip, local_b as usize), SIG_LOCAL, "second local sig");
 
-        // Navigate to ZIP64 EOCD via the locator embedded in the standard EOCD tail.
-        let eocd_std = zip.len() - 22;
-        let loc_off = eocd_std - 20;
-        let z64_off = u64le(&zip, loc_off + 8) as usize;
-        let cd_offset = u64le(&zip, z64_off + 48) as usize;
+        // Navigate to the central directory via the standard EOCD's real
+        // offset (small archive → no ZIP64 trailer).
+        let eocd = zip.len() - 22;
+        assert_eq!(u32le(&zip, eocd), SIG_EOCD);
+        let cd_offset = u32le(&zip, eocd + 16) as usize;
 
         // First CD entry: local_offset64 = 0
         let name_len_cd_a = u16le(&zip, cd_offset + 28) as usize;
