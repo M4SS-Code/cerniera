@@ -42,7 +42,7 @@ pub struct InvalidMsDosDateTime;
 /// `1980-00-00 00:00:00`.
 ///
 /// Use [`new`](Self::new) to construct a value from calendar components.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MsDosDateTime {
     time: u16,
     date: u16,
@@ -1600,11 +1600,9 @@ mod tests {
             .unwrap()
             .to_zoned(jiff::tz::TimeZone::UTC);
         let times = FileTimes::try_from(zoned).unwrap();
-        // MsDosDateTime has no PartialEq; compare the packed fields.
-        let expected = MsDosDateTime::new(2026, 3, 10, 12, 30, 0).unwrap();
         assert_eq!(
-            (times.dos().time, times.dos().date),
-            (expected.time, expected.date)
+            times.dos(),
+            MsDosDateTime::new(2026, 3, 10, 12, 30, 0).unwrap()
         );
         assert_eq!(times.unix(), Some(1_773_145_800));
 
