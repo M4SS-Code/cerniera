@@ -88,6 +88,12 @@ pin_project! {
     /// stored (uncompressed); CRC-32 checksums and all ZIP bookkeeping are
     /// handled automatically.
     ///
+    /// Errors are terminal: when an entry's content stream or the entry
+    /// list yields an `Err`, the error is surfaced once and the stream
+    /// yields `None` on every later poll. A content error can arrive
+    /// mid-entry, when the archive already holds a partial record, so the
+    /// stream can no longer produce a valid archive afterwards.
+    ///
     /// For compressed output or custom I/O, use [`ZipArchive`] directly.
     ///
     /// See the [crate-level docs](crate) for a full example.
@@ -137,7 +143,15 @@ where
             match stream.poll_next(cx) {
                 Poll::Pending => Poll::Pending,
 
-                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+                Poll::Ready(Some(Err(e))) => {
+                    // Terminal: a content error can arrive mid-entry, when
+                    // the archive already holds a partial record, so no
+                    // valid archive can be produced afterwards. Drop the
+                    // content stream, yield the error once, then end.
+                    *this.done = true;
+                    this.current_stream.set(None);
+                    Poll::Ready(Some(Err(e)))
+                }
 
                 Poll::Ready(Some(Ok(chunk))) => {
                     this.archive.file_data(&chunk);
@@ -154,7 +168,12 @@ where
             match this.entries.as_mut().poll_next(cx) {
                 Poll::Pending => Poll::Pending,
 
-                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+                Poll::Ready(Some(Err(e))) => {
+                    // Terminal, like content errors: yield the error once,
+                    // then end.
+                    *this.done = true;
+                    Poll::Ready(Some(Err(e)))
+                }
 
                 Poll::Ready(Some(Ok(entry))) => match entry.inner {
                     EntryInner::File {
