@@ -724,6 +724,11 @@ impl ZipArchive {
     /// Encode the central directory and the end-of-central-directory
     /// trailer into `buf`. This finalizes the archive.
     ///
+    /// The central directory and the trailer are encoded into `buf` in
+    /// one go: every entry's metadata is retained until this call, and
+    /// the entire central directory lands in `buf` as a single region -
+    /// one large allocation when `buf` is streamed out.
+    ///
     /// A ZIP64 end-of-central-directory record and locator are written only
     /// when the standard EOCD's 16/32-bit fields cannot represent the
     /// archive (APPNOTE §4.4.22-4.4.24); otherwise the archive ends with

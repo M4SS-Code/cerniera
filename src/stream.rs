@@ -94,6 +94,15 @@ pin_project! {
     /// mid-entry, when the archive already holds a partial record, so the
     /// stream can no longer produce a valid archive afterwards.
     ///
+    /// # Memory
+    ///
+    /// Every entry's metadata (path and bookkeeping, on the order of
+    /// 100 bytes) is retained until the entry stream ends, and the
+    /// central directory is then encoded into a single final chunk -
+    /// one large allocation and one long poll, regardless of downstream
+    /// backpressure. If the entry list comes from untrusted input, bound
+    /// the entry count (and total size) before feeding it.
+    ///
     /// For compressed output or custom I/O, use [`ZipArchive`] directly.
     ///
     /// See the [crate-level docs](crate) for a full example.

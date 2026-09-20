@@ -52,7 +52,10 @@ async fn main() -> io::Result<()> {
 
 - **`ZipWriter`** - high-level streaming builder. Give it entries, get a byte
   stream. Handles CRC-32 and all ZIP bookkeeping automatically. Files are
-  stored (uncompressed).
+  stored (uncompressed). Note that every entry's metadata is retained until
+  the stream completes, and the central directory is then emitted as a
+  single final chunk - bound the entry count when the entry list is
+  untrusted.
 
 - **`ZipArchive`** - low-level, sans-IO encoder. Gives you full control over
   buffering and compression (DEFLATE, Zstandard, etc.) at the cost of a more
