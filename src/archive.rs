@@ -515,9 +515,10 @@ impl Default for ZipArchive {
 
 /// Local file header: 30 bytes fixed + `name.len()`.
 ///
-/// CRC-32 and sizes are all zero because GP bit 3 (data descriptor) is set.
-/// The real values appear in the data descriptor that follows the file
-/// data, and in the central directory's ZIP64 extra field.
+/// CRC-32 and sizes are all zero because GP bit 3 (data descriptor) is
+/// set: the local header is written before the sizes are known, so the
+/// real values appear in the data descriptor that follows the file data
+/// and in the central directory.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "ZipPath guarantees the name fits in u16"
@@ -574,13 +575,15 @@ fn encode_data_descriptor(
     }
 }
 
-/// Central directory file header: 46 bytes fixed + `name.len()` + 28 bytes ZIP64 extra.
+/// Central directory file header: 46 bytes fixed + `name.len()`, plus a
+/// ZIP64 extra field when a 32-bit size/offset field does not fit.
 ///
-/// The 32-bit size and offset fields carry `0xFFFF_FFFF` sentinels; the real
-/// 64-bit values live in the ZIP64 extra block per APPNOTE §4.5.3.
-// ZIP64 extra: tag(2) + block_len(2) + orig(8) + comp(8) + local_offset(8) = 28
-const CD_EXTRA_LEN: u16 = 28;
-
+/// The 32-bit fields carry the real values whenever they fit; a field
+/// that does not fit - or that would carry the sentinel value itself -
+/// is written as a `0xFFFF_FFFF` sentinel and repeated as an 8-byte
+/// value in the ZIP64 extra block, whose fields appear in fixed order
+/// and only when the corresponding record field is a sentinel (APPNOTE
+/// §4.5.3).
 #[expect(
     clippy::cast_possible_truncation,
     reason = "ZipPath guarantees the name fits in u16"
@@ -592,7 +595,22 @@ fn encode_cd_entry(e: &CdEntry, b: &mut BytesMut) {
     } else {
         0o100_644 << 16 // S_IFREG + rw-r--r--
     };
-    b.reserve(46 + name.len() + CD_EXTRA_LEN as usize);
+
+    // A 32-bit field that cannot hold the value becomes a sentinel and is
+    // repeated in the ZIP64 extra block (APPNOTE §4.5.3).
+    let compressed = cd_field32(e.compressed_size);
+    let uncompressed = cd_field32(e.uncompressed_size);
+    let offset = cd_field32(e.local_offset);
+    let zip64_fields = u8::from(compressed.is_none())
+        + u8::from(uncompressed.is_none())
+        + u8::from(offset.is_none());
+    let extra_len: u16 = if zip64_fields == 0 {
+        0
+    } else {
+        u16::from(4 + 8 * zip64_fields)
+    };
+
+    b.reserve(46 + name.len() + usize::from(extra_len));
 
     b.put_u32_le(SIG_CENTRAL);
     b.put_u16_le(VERSION_MADE_BY);
@@ -602,22 +620,32 @@ fn encode_cd_entry(e: &CdEntry, b: &mut BytesMut) {
     b.put_u16_le(e.modified.time);
     b.put_u16_le(e.modified.date);
     b.put_u32_le(e.crc32);
-    b.put_u32_le(0xFFFF_FFFF); // compressed size  ─┐ sentinel:
-    b.put_u32_le(0xFFFF_FFFF); // uncompressed size  │ see ZIP64 extra
+    b.put_u32_le(compressed.unwrap_or(u32::MAX));
+    b.put_u32_le(uncompressed.unwrap_or(u32::MAX));
     b.put_u16_le(name.len() as u16);
-    b.put_u16_le(CD_EXTRA_LEN);
+    b.put_u16_le(extra_len);
     b.put_u16_le(0); // file comment length
     b.put_u16_le(0); // disk number start
     b.put_u16_le(0); // internal file attributes
     b.put_u32_le(external_attr);
-    b.put_u32_le(0xFFFF_FFFF); // local header offset ── sentinel
+    b.put_u32_le(offset.unwrap_or(u32::MAX));
     b.put_slice(name);
-    // ZIP64 extended information extra field
-    b.put_u16_le(TAG_ZIP64);
-    b.put_u16_le(24); // block payload length
-    b.put_u64_le(e.uncompressed_size);
-    b.put_u64_le(e.compressed_size);
-    b.put_u64_le(e.local_offset);
+    if zip64_fields > 0 {
+        // ZIP64 extended information extra field (APPNOTE §4.5.3):
+        // fixed field order, present only when the record field is a
+        // sentinel.
+        b.put_u16_le(TAG_ZIP64);
+        b.put_u16_le(u16::from(8 * zip64_fields));
+        if uncompressed.is_none() {
+            b.put_u64_le(e.uncompressed_size);
+        }
+        if compressed.is_none() {
+            b.put_u64_le(e.compressed_size);
+        }
+        if offset.is_none() {
+            b.put_u64_le(e.local_offset);
+        }
+    }
 }
 
 /// ZIP64 end-of-central-directory record (56 bytes, no extensible data sector).
@@ -672,6 +700,16 @@ fn encode_eocd(num_entries: u64, cd_size: u64, cd_offset: u64, b: &mut BytesMut)
     b.put_u16_le(0); // ZIP comment length
 }
 
+/// Real value for a central directory 32-bit field, or `None` when the
+/// field must carry the `0xFFFF_FFFF` sentinel: the value either does not
+/// fit in 32 bits or equals the sentinel itself, in which case readers
+/// could not tell a real value apart from the ZIP64 marker - current
+/// `OpenJDK` rejects an archive whose sentinel-looking field has no ZIP64
+/// extra. Go's archive/zip uses the same sentinel-inclusive threshold.
+fn cd_field32(v: u64) -> Option<u32> {
+    u32::try_from(v).ok().filter(|&v| v != u32::MAX)
+}
+
 /// Whether the standard EOCD's 16/32-bit fields cannot represent the
 /// archive, so that a ZIP64 EOCD record is required (APPNOTE
 /// §4.4.22-4.4.24). Fields equal to the sentinels (0xFFFF entries,
@@ -720,7 +758,7 @@ mod tests {
     //
     //  Local header  = 30 + name_len        (no extra field)
     //  Data descr.   = 16                  (sig+crc+comp_size+orig_size; 24 if ≥ 4 GiB)
-    //  CD entry      = 46 + name_len + 28  (ZIP64 extra: tag+len+orig+comp+off)
+    //  CD entry      = 46 + name_len (+ ZIP64 extra only on 32-bit overflow)
     //  ZIP64 EOCD    = 56  (only when the plain EOCD fields overflow)
     //  ZIP64 locator = 20  (same)
     //  Standard EOCD = 22
@@ -801,28 +839,18 @@ mod tests {
         assert_eq!(u32le(&zip, dd + 12), content.len() as u32, "orig size");
 
         // ── Central directory ─────────────────────────────────────────────
+        // All values fit in 32 bits → real values, no ZIP64 extra.
         let cd = dd + 16;
         assert_eq!(u32le(&zip, cd), SIG_CENTRAL);
         assert_eq!(u16le(&zip, cd + 4), VERSION_MADE_BY);
-        assert_eq!(u32le(&zip, cd + 20), 0xFFFF_FFFF, "comp size sentinel");
-        assert_eq!(u32le(&zip, cd + 24), 0xFFFF_FFFF, "orig size sentinel");
-        assert_eq!(u32le(&zip, cd + 42), 0xFFFF_FFFF, "offset sentinel");
+        assert_eq!(u32le(&zip, cd + 20), content.len() as u32, "comp size");
+        assert_eq!(u32le(&zip, cd + 24), content.len() as u32, "orig size");
+        assert_eq!(u32le(&zip, cd + 42), 0, "local offset");
         let cd_name_len = u16le(&zip, cd + 28) as usize;
         let cd_extra_len = u16le(&zip, cd + 30) as usize;
         assert_eq!(cd_name_len, 9);
-        assert_eq!(cd_extra_len, 28);
+        assert_eq!(cd_extra_len, 0, "no ZIP64 extra");
         assert_eq!(u32le(&zip, cd + 16), expected_crc, "cd crc32");
-        // ZIP64 extra in CD
-        let cex = cd + 46 + cd_name_len;
-        assert_eq!(u16le(&zip, cex), TAG_ZIP64);
-        assert_eq!(u16le(&zip, cex + 2), 24);
-        assert_eq!(u64le(&zip, cex + 4), content.len() as u64, "cd orig size64");
-        assert_eq!(
-            u64le(&zip, cex + 12),
-            content.len() as u64,
-            "cd comp size64"
-        );
-        assert_eq!(u64le(&zip, cex + 20), 0u64, "local offset = 0");
 
         // ── Standard EOCD ─────────────────────────────────────────────────
         // Small archive: the plain EOCD carries the real values and no
@@ -834,6 +862,72 @@ mod tests {
         assert_eq!(u32le(&zip, eocd + 12), cd_entry_size as u32, "cd size");
         assert_eq!(u32le(&zip, eocd + 16), cd as u32, "cd offset");
         assert_eq!(zip.len(), eocd + 22);
+    }
+
+    #[test]
+    fn cd_zip64_extra_only_for_overflowing_fields() {
+        let name = "big.bin";
+
+        // Only the compressed size overflows → the extra carries just that
+        // field; the other 32-bit fields hold real values.
+        let mut entry = CdEntry {
+            path: name.try_into().unwrap(),
+            modified: MsDosDateTime::default(),
+            method: CompressionMethod::Stored,
+            crc32: 0,
+            compressed_size: u64::from(u32::MAX) + 1,
+            uncompressed_size: 1234,
+            local_offset: 7,
+        };
+        let mut b = BytesMut::new();
+        encode_cd_entry(&entry, &mut b);
+        assert_eq!(b.len(), 46 + name.len() + 12);
+        assert_eq!(u32le(&b, 20), u32::MAX, "comp size sentinel");
+        assert_eq!(u32le(&b, 24), 1234, "orig size real");
+        assert_eq!(u32le(&b, 42), 7, "offset real");
+        let cex = 46 + name.len();
+        assert_eq!(u16le(&b, cex), TAG_ZIP64);
+        assert_eq!(u16le(&b, cex + 2), 8, "one 8-byte field");
+        assert_eq!(u64le(&b, cex + 4), entry.compressed_size);
+
+        // All three overflow → 8-byte fields in the fixed order:
+        // uncompressed, compressed, offset.
+        entry.uncompressed_size = u64::from(u32::MAX) + 2;
+        entry.local_offset = u64::from(u32::MAX) + 3;
+        let mut b = BytesMut::new();
+        encode_cd_entry(&entry, &mut b);
+        assert_eq!(b.len(), 46 + name.len() + 28);
+        assert_eq!(u16le(&b, cex + 2), 24);
+        assert_eq!(u64le(&b, cex + 4), entry.uncompressed_size, "orig first");
+        assert_eq!(u64le(&b, cex + 12), entry.compressed_size, "comp second");
+        assert_eq!(u64le(&b, cex + 20), entry.local_offset, "offset last");
+
+        // Values exactly at the sentinel also go to the extra: a real
+        // 0xFFFF_FFFF in the field is indistinguishable from the
+        // sentinel, and current OpenJDK rejects the archive when no
+        // ZIP64 extra backs it.
+        entry.compressed_size = u64::from(u32::MAX);
+        entry.uncompressed_size = u64::from(u32::MAX);
+        entry.local_offset = 7;
+        let mut b = BytesMut::new();
+        encode_cd_entry(&entry, &mut b);
+        assert_eq!(b.len(), 46 + name.len() + 20);
+        assert_eq!(u32le(&b, 20), u32::MAX, "comp size sentinel");
+        assert_eq!(u32le(&b, 24), u32::MAX, "orig size sentinel");
+        assert_eq!(u32le(&b, 42), 7, "offset real");
+        assert_eq!(u16le(&b, cex), TAG_ZIP64);
+        assert_eq!(u16le(&b, cex + 2), 16, "two 8-byte fields");
+        assert_eq!(u64le(&b, cex + 4), u64::from(u32::MAX), "orig first");
+        assert_eq!(u64le(&b, cex + 12), u64::from(u32::MAX), "comp second");
+
+        // Nothing overflows → no extra field at all.
+        entry.compressed_size = 1;
+        entry.uncompressed_size = 2;
+        entry.local_offset = 3;
+        let mut b = BytesMut::new();
+        encode_cd_entry(&entry, &mut b);
+        assert_eq!(b.len(), 46 + name.len());
+        assert_eq!(u16le(&b, 30), 0, "no extra field");
     }
 
     #[test]
@@ -1056,17 +1150,20 @@ mod tests {
         assert_eq!(u32le(&zip, eocd), SIG_EOCD);
         let cd_offset = u32le(&zip, eocd + 16) as usize;
 
-        // First CD entry: local_offset64 = 0
-        let name_len_cd_a = u16le(&zip, cd_offset + 28) as usize;
-        let extra_len_cd_a = u16le(&zip, cd_offset + 30) as usize;
-        let cex_a = cd_offset + 46 + name_len_cd_a;
-        assert_eq!(u64le(&zip, cex_a + 20), 0, "first entry local offset = 0");
+        // First CD entry: local offset in the 32-bit field (no ZIP64
+        // extra, all values fit).
+        assert_eq!(
+            u32le(&zip, cd_offset + 42),
+            0,
+            "first entry local offset = 0"
+        );
 
         // Second CD entry
+        let name_len_cd_a = u16le(&zip, cd_offset + 28) as usize;
+        let extra_len_cd_a = u16le(&zip, cd_offset + 30) as usize;
         let cd_b = cd_offset + 46 + name_len_cd_a + extra_len_cd_a;
-        let cex_b = cd_b + 46 + u16le(&zip, cd_b + 28) as usize;
         assert_eq!(
-            u64le(&zip, cex_b + 20),
+            u64::from(u32le(&zip, cd_b + 42)),
             local_b,
             "second entry local offset"
         );
