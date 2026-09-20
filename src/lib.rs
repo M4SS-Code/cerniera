@@ -4,7 +4,7 @@
 //! write it directly with `sendfile`, `mmap`, or any I/O strategy you
 //! like - cerniera only encodes the ZIP framing around it.
 //!
-//! *Cerniera* (/t∫erˈnjɛra/) is Italian for *zipper*.
+//! *Cerniera* (/tʃerˈnjɛːra/) is Italian for *zipper*.
 //!
 //! # Quick start
 //!

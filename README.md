@@ -9,7 +9,7 @@ encodes the ZIP framing around it.
 ZIP64 records are written only where needed: entries over 4 GiB and
 archives with more than 65,535 entries are supported.
 
-*Cerniera* (/t∫erˈnjɛra/) is Italian for *zipper*.
+*Cerniera* (/tʃerˈnjɛːra/) is Italian for *zipper*.
 
 ## Quick start
 
