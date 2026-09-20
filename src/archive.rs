@@ -463,6 +463,10 @@ pub struct ZipArchive {
     cd: Vec<CdEntry>,
     offset: u64,
     active: Option<ActiveFile>,
+    /// Set by `finish()`; the trailer is the last thing in the archive,
+    /// so any entry added after it would land past the end of the
+    /// declared central directory.
+    finished: bool,
 }
 
 impl ZipArchive {
@@ -472,6 +476,7 @@ impl ZipArchive {
             cd: Vec::new(),
             offset: 0,
             active: None,
+            finished: false,
         }
     }
 
@@ -490,9 +495,9 @@ impl ZipArchive {
     /// # Panics
     ///
     /// Panics if a previous file was not ended with [`end_file`](Self::end_file)
-    /// or [`end_file_compressed`](Self::end_file_compressed), or if `path`
-    /// ends with `'/'` - use [`add_directory`](Self::add_directory) for
-    /// directories.
+    /// or [`end_file_compressed`](Self::end_file_compressed), if the archive
+    /// was already finished, or if `path` ends with `'/'` - use
+    /// [`add_directory`](Self::add_directory) for directories.
     pub fn start_file(
         &mut self,
         path: ZipPath,
@@ -501,6 +506,7 @@ impl ZipArchive {
         buf: &mut BytesMut,
     ) {
         assert!(self.active.is_none(), "previous file not ended");
+        assert!(!self.finished, "archive already finished");
         // The trailing-slash convention selects the entry kind: every
         // extractor keys on it to classify the entry, and the central
         // directory entry re-derives the kind from the path. A file
@@ -638,11 +644,13 @@ impl ZipArchive {
     /// # Panics
     ///
     /// Panics if a previous file was not ended with [`end_file`](Self::end_file)
-    /// or [`end_file_compressed`](Self::end_file_compressed), or if `path`
-    /// does not end with `'/'` - extractors classify an entry as a
-    /// directory by its trailing slash.
+    /// or [`end_file_compressed`](Self::end_file_compressed), if the archive
+    /// was already finished, or if `path` does not end with `'/'` -
+    /// extractors classify an entry as a directory by its trailing
+    /// slash.
     pub fn add_directory(&mut self, path: ZipPath, times: FileTimes, buf: &mut BytesMut) {
         assert!(self.active.is_none(), "previous file not ended");
+        assert!(!self.finished, "archive already finished");
         assert!(
             path.as_str().ends_with('/'),
             "directory entry path must end with '/': {path}"
@@ -681,9 +689,12 @@ impl ZipArchive {
     /// # Panics
     ///
     /// Panics if a previous file was not ended with [`end_file`](Self::end_file)
-    /// or [`end_file_compressed`](Self::end_file_compressed).
+    /// or [`end_file_compressed`](Self::end_file_compressed), or if the
+    /// archive was already finished.
     pub fn finish(&mut self, buf: &mut BytesMut) {
         assert!(self.active.is_none(), "file not ended before finish");
+        assert!(!self.finished, "archive already finished");
+        self.finished = true;
 
         let cd_start = self.offset;
 
@@ -1340,6 +1351,38 @@ mod tests {
         let mut archive = ZipArchive::new();
         let mut buf = BytesMut::new();
         archive.add_directory("dir".try_into().unwrap(), FileTimes::default(), &mut buf);
+    }
+
+    #[test]
+    #[should_panic(expected = "archive already finished")]
+    fn finish_twice_panics() {
+        let mut archive = ZipArchive::new();
+        let mut buf = BytesMut::new();
+        archive.finish(&mut buf);
+        archive.finish(&mut buf);
+    }
+
+    #[test]
+    #[should_panic(expected = "archive already finished")]
+    fn start_file_after_finish_panics() {
+        let mut archive = ZipArchive::new();
+        let mut buf = BytesMut::new();
+        archive.finish(&mut buf);
+        archive.start_file(
+            "a.txt".try_into().unwrap(),
+            FileTimes::default(),
+            CompressionMethod::Stored,
+            &mut buf,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "archive already finished")]
+    fn add_directory_after_finish_panics() {
+        let mut archive = ZipArchive::new();
+        let mut buf = BytesMut::new();
+        archive.finish(&mut buf);
+        archive.add_directory("a/".try_into().unwrap(), FileTimes::default(), &mut buf);
     }
 
     // std-only: swapping the panic hook keeps the caught panic out of the
