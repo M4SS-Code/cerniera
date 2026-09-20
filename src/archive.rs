@@ -600,6 +600,10 @@ impl ZipArchive {
     /// [`file_data`](Self::file_data)). The caller provides `compressed_size`
     /// - the number of compressed bytes actually written to the output.
     ///
+    /// The value is trusted: as a sans-IO encoder, cerniera cannot verify
+    /// it, and a size that does not match the bytes actually written
+    /// corrupts the local-header offset of every entry that follows.
+    ///
     /// # Panics
     ///
     /// Panics if no file is currently active (i.e. [`start_file`](Self::start_file)
