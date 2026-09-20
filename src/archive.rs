@@ -213,8 +213,9 @@ impl TryFrom<jiff::Zoned> for FileTimes {
 // ── Paths ─────────────────────────────────────────────────────────────────────
 
 /// Error returned when a ZIP entry path is rejected: either because it
-/// does not fit the format's 16-bit name length field, or because its
-/// shape does not match the requested entry kind.
+/// does not fit the format's 16-bit name length field, because its
+/// shape could break extraction, or because its shape does not match
+/// the requested entry kind.
 ///
 /// The rejected path can be recovered with [`into_inner`](Self::into_inner).
 /// The enum may grow new rejection reasons: match with a wildcard arm.
@@ -226,7 +227,7 @@ pub enum InvalidZipPath {
     #[error("file name length {} exceeds 65535 bytes", .0.len())]
     TooLong(Cow<'static, str>),
     /// The path could escape the extraction directory or break readers
-    /// (see [`ZipPath::new`](ZipPath::new)).
+    /// (see [`ZipPath::new`](ZipPath::new) for the rejected shapes).
     #[error("unsafe entry path: {}", .0)]
     Dangerous(Cow<'static, str>),
     /// The path ends with `'/'`, which names a directory, but a file
@@ -252,7 +253,7 @@ impl InvalidZipPath {
     }
 }
 
-/// A ZIP entry path, validated to fit the format's 16-bit name length field.
+/// A ZIP entry path, validated on construction.
 ///
 /// Holds a [`Cow`], so paths built from `&'static str` (e.g. string
 /// literals) don't allocate:
@@ -264,28 +265,52 @@ impl InvalidZipPath {
 /// let path = ZipPath::new("docs/report.pdf").unwrap();
 /// // Owned.
 /// let path: ZipPath = String::from("docs/report.pdf").try_into().unwrap();
+/// // Untrusted input is also checked for extraction hazards.
+/// assert!(ZipPath::new("../secret").is_err());
 /// ```
 ///
-/// Paths are stored as-is: cerniera does not normalize separators or reject
-/// special components such as `..`; callers zipping untrusted names should
-/// sanitize them first.
+/// The name is stored as-is: validation happens in [`new`](Self::new)
+/// (and the `TryFrom` impls), which reject extraction hazards - see its
+/// docs for the rejected shapes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ZipPath(Cow<'static, str>);
 
 impl ZipPath {
-    /// Validate that `path` fits the 16-bit name length field.
+    /// Validate `path` as a ZIP entry name.
+    ///
+    /// The name must fit the format's 16-bit name length field and must
+    /// be safe for extractors to expand, so `new` rejects:
+    ///
+    /// - paths longer than 65535 bytes;
+    /// - empty paths;
+    /// - absolute paths (leading `/`) and colons anywhere: a leading
+    ///   drive letter (`C:...`) makes the path absolute on Windows, and
+    ///   a colon in a later component (e.g. `dir/C:evil`) names an
+    ///   alternate data stream on NTFS or a path on another drive;
+    /// - `..` components, which extractors may resolve outside the
+    ///   destination directory (zip-slip);
+    /// - backslashes, which some extractors treat as separators (the
+    ///   format's separator is `/`);
+    /// - NUL bytes, which truncate names in C-based readers.
+    ///
+    /// Dangerous paths are rejected, not rewritten: a silently renamed
+    /// path hides the decision from the caller. Handle the error by
+    /// skipping the entry, choosing a new name, or failing.
     ///
     /// # Errors
     ///
-    /// Returns [`InvalidZipPath`] if `path` is longer than 65535 bytes;
-    /// the rejected path can be recovered from the error.
+    /// Returns [`InvalidZipPath`] when the path does not fit the 16-bit
+    /// name length field or has one of the shapes above; the rejected
+    /// path can be recovered from the error.
     pub fn new(path: impl Into<Cow<'static, str>>) -> Result<Self, InvalidZipPath> {
         let path = path.into();
-        if u16::try_from(path.len()).is_ok() {
-            Ok(Self(path))
-        } else {
-            Err(InvalidZipPath::TooLong(path))
+        if u16::try_from(path.len()).is_err() {
+            return Err(InvalidZipPath::TooLong(path));
         }
+        if is_unsafe(&path) {
+            return Err(InvalidZipPath::Dangerous(path));
+        }
+        Ok(Self(path))
     }
 
     /// View the path as a string slice.
@@ -335,6 +360,20 @@ impl TryFrom<Cow<'static, str>> for ZipPath {
     fn try_from(path: Cow<'static, str>) -> Result<Self, Self::Error> {
         Self::new(path)
     }
+}
+
+/// Whether a path has a shape that could escape the extraction
+/// directory or break readers (see [`ZipPath::new`]).
+///
+/// A colon is rejected anywhere: a leading drive letter (`C:`) makes
+/// the path absolute on Windows, and a colon in a later component
+/// (e.g. `dir/C:evil`) names an alternate data stream on NTFS or a
+/// path relative to another drive.
+fn is_unsafe(path: &str) -> bool {
+    path.is_empty()
+        || path.starts_with('/')
+        || path.contains([':', '\\', '\0'])
+        || path.split('/').any(|component| component == "..")
 }
 
 // ── Compression ──────────────────────────────────────────────────────────────
@@ -1484,6 +1523,41 @@ mod tests {
         // Static strings are stored borrowed - no allocation.
         let path = ZipPath::new("hello.txt").unwrap();
         assert!(matches!(path.into_inner(), Cow::Borrowed("hello.txt")));
+    }
+
+    #[test]
+    fn zip_path_new_validation() {
+        // Safe names pass, including directory and nested paths.
+        assert!(ZipPath::new("hello.txt").is_ok());
+        assert!(ZipPath::new("dir/sub/file.bin").is_ok());
+        assert!(ZipPath::new("dir/").is_ok());
+
+        // Each dangerous shape is rejected with the path recoverable.
+        for path in [
+            "",
+            "..",
+            "../x",
+            "a/../b",
+            "/abs",
+            "C:file",
+            "dir/C:evil",
+            "./C:evil",
+            "report.txt:payload",
+            "a:b",
+            "c:\\abs",
+            "a\\b",
+            "a\0b",
+        ] {
+            match ZipPath::new(path) {
+                Err(InvalidZipPath::Dangerous(rejected)) => assert_eq!(rejected, path),
+                _ => panic!("path should be rejected as dangerous: {path}"),
+            }
+        }
+
+        // The length limit still applies.
+        let long = "a".repeat(65_536);
+        let err = ZipPath::new(long.clone()).unwrap_err();
+        assert!(matches!(err, InvalidZipPath::TooLong(p) if p == long));
     }
 
     #[test]

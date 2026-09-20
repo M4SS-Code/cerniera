@@ -56,6 +56,18 @@ async fn main() -> io::Result<()> {
   manual lifecycle. See the [`deflate_zip`](examples/deflate_zip.rs) and
   [`sendfile_zip`](examples/sendfile_zip.rs) examples.
 
+Entry paths are validated on construction: `ZipPath::new` rejects
+traversal (`..`), absolute paths, drive letters, colons, backslashes,
+and NUL bytes, and the `ZipEntry::file` / `ZipEntry::directory`
+constructors enforce the file/directory slash convention - so untrusted
+names can be passed straight through the constructors.
+
+That is shape validation, not a universal extraction guarantee: names
+like `CON` or `report.` are legal here but can still misbehave in
+permissive Windows extractors, and duplicate names are written as-is,
+leaving collision resolution to the extractor. Extraction safety
+ultimately depends on the reader that unpacks the archive.
+
 ## Features
 
 | Feature | Default | Description |
