@@ -122,6 +122,7 @@ where
     I: Stream<Item = Result<ZipEntry<S>, E>>,
     S: Stream<Item = Result<Bytes, E>>,
 {
+    #[must_use]
     pub fn new(entries: I) -> Self {
         Self {
             current_stream: None,
