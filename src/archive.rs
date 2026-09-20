@@ -17,10 +17,14 @@ const SIG_EOCD: u32 = 0x0605_4b50;
 // ZIP64 extra-field block tag.
 const TAG_ZIP64: u16 = 0x0001;
 
-// version needed to extract: 4.5 (ZIP64)
-const VERSION_NEEDED: u16 = 45;
-// version made by: Unix (0x03) / spec 4.5
-const VERSION_MADE_BY: u16 = (3 << 8) | 0x2D;
+// version needed to extract for entries using ZIP64 (APPNOTE §4.4.3.2)
+const VERSION_ZIP64: u16 = 45;
+// version made by: Unix (0x03) in the high byte; the low byte is the
+// spec version of the software that wrote the entry
+const VERSION_MADE_BY_OS: u16 = 3 << 8;
+// version made by for records that are not per-entry (the ZIP64 EOCD):
+// Unix / spec 4.5
+const VERSION_MADE_BY: u16 = VERSION_MADE_BY_OS | VERSION_ZIP64;
 
 // ── Date / time ──────────────────────────────────────────────────────────────
 
@@ -236,6 +240,19 @@ pub enum CompressionMethod {
     Zstd = 93,
 }
 
+/// Minimum "version needed to extract" for a compression method
+/// (APPNOTE §4.4.3.2). Zstandard (method 93) has no entry in the
+/// published table; 4.5 is the oldest version that can reasonably
+/// claim to handle it.
+const fn method_version_needed(method: CompressionMethod) -> u16 {
+    match method {
+        CompressionMethod::Stored | CompressionMethod::Deflate => 20,
+        CompressionMethod::Bzip2 => 46,
+        CompressionMethod::Lzma => 63,
+        CompressionMethod::Zstd => 45,
+    }
+}
+
 // ── Internal bookkeeping ──────────────────────────────────────────────────────
 
 /// Central-directory metadata accumulated as each entry is completed.
@@ -324,7 +341,11 @@ impl ZipArchive {
 
         let local_offset = self.offset;
         let before = buf.len();
-        encode_local_header(path.as_str(), modified, method, buf);
+        // The local header is written before the entry's sizes are known,
+        // so it always declares ZIP64 capability alongside the method
+        // minimum (APPNOTE §4.4.3.1: the highest applicable feature).
+        let version = u16::max(method_version_needed(method), VERSION_ZIP64);
+        encode_local_header(path.as_str(), modified, method, version, buf);
         self.offset += (buf.len() - before) as u64;
 
         self.active = Some(ActiveFile {
@@ -453,7 +474,17 @@ impl ZipArchive {
 
         let local_offset = self.offset;
         let before = buf.len();
-        encode_local_header(path.as_str(), modified, CompressionMethod::Stored, buf);
+        let version = u16::max(
+            method_version_needed(CompressionMethod::Stored),
+            VERSION_ZIP64,
+        );
+        encode_local_header(
+            path.as_str(),
+            modified,
+            CompressionMethod::Stored,
+            version,
+            buf,
+        );
         encode_data_descriptor(0, 0, 0, buf);
         self.offset += (buf.len() - before) as u64;
 
@@ -527,13 +558,14 @@ fn encode_local_header(
     path: &str,
     modified: MsDosDateTime,
     method: CompressionMethod,
+    version: u16,
     b: &mut BytesMut,
 ) {
     let name = path.as_bytes();
     b.reserve(30 + name.len());
 
     b.put_u32_le(SIG_LOCAL);
-    b.put_u16_le(VERSION_NEEDED);
+    b.put_u16_le(version);
     b.put_u16_le(0x0808); // GP flag: bit 3 = data descriptor, bit 11 = UTF-8
     b.put_u16_le(method as u16);
     b.put_u16_le(modified.time);
@@ -612,9 +644,22 @@ fn encode_cd_entry(e: &CdEntry, b: &mut BytesMut) {
 
     b.reserve(46 + name.len() + usize::from(extra_len));
 
+    // The central directory is the authoritative header: it declares the
+    // highest feature actually used - the method minimum, raised to 4.5
+    // when a ZIP64 extra field is present (APPNOTE §4.4.3.1).
+    let version = if zip64_fields > 0 {
+        u16::max(method_version_needed(e.method), VERSION_ZIP64)
+    } else {
+        method_version_needed(e.method)
+    };
+
     b.put_u32_le(SIG_CENTRAL);
-    b.put_u16_le(VERSION_MADE_BY);
-    b.put_u16_le(VERSION_NEEDED);
+    // The made-by version never claims less than the entry's
+    // version-needed (a 6.3 LZMA entry should not say the writer
+    // implements only 4.5) and never less than the 4.5 baseline
+    // cerniera itself implements.
+    b.put_u16_le(VERSION_MADE_BY_OS | u16::max(version, VERSION_ZIP64));
+    b.put_u16_le(version);
     b.put_u16_le(0x0808); // GP flag: bit 3 = data descriptor, bit 11 = UTF-8
     b.put_u16_le(e.method as u16);
     b.put_u16_le(e.modified.time);
@@ -657,7 +702,7 @@ fn encode_zip64_eocd(num_entries: u64, cd_size: u64, cd_offset: u64, b: &mut Byt
     b.put_u32_le(SIG_ZIP64_EOCD);
     b.put_u64_le(44); // size of the remaining record (56 - 12)
     b.put_u16_le(VERSION_MADE_BY);
-    b.put_u16_le(VERSION_NEEDED);
+    b.put_u16_le(VERSION_ZIP64);
     b.put_u32_le(0); // number of this disk
     b.put_u32_le(0); // disk where CD starts
     b.put_u64_le(num_entries); // CD entries on this disk
@@ -815,7 +860,8 @@ mod tests {
 
         // ── Local header ─────────────────────────────────────────────────
         assert_eq!(u32le(&zip, 0), SIG_LOCAL, "local sig");
-        assert_eq!(u16le(&zip, 4), VERSION_NEEDED, "version needed");
+        // Streaming entries always declare ZIP64 capability.
+        assert_eq!(u16le(&zip, 4), VERSION_ZIP64, "version needed");
         assert_eq!(u16le(&zip, 6), 0x0808, "GP bit 3 + bit 11");
         assert_eq!(u32le(&zip, 14), 0, "crc deferred");
         assert_eq!(u32le(&zip, 18), 0, "comp size deferred");
@@ -843,6 +889,12 @@ mod tests {
         let cd = dd + 16;
         assert_eq!(u32le(&zip, cd), SIG_CENTRAL);
         assert_eq!(u16le(&zip, cd + 4), VERSION_MADE_BY);
+        // No ZIP64 extra was needed → the method minimum (2.0) stands.
+        assert_eq!(
+            u16le(&zip, cd + 6),
+            method_version_needed(CompressionMethod::Stored),
+            "version needed"
+        );
         assert_eq!(u32le(&zip, cd + 20), content.len() as u32, "comp size");
         assert_eq!(u32le(&zip, cd + 24), content.len() as u32, "orig size");
         assert_eq!(u32le(&zip, cd + 42), 0, "local offset");
@@ -928,6 +980,46 @@ mod tests {
         encode_cd_entry(&entry, &mut b);
         assert_eq!(b.len(), 46 + name.len());
         assert_eq!(u16le(&b, 30), 0, "no extra field");
+    }
+
+    #[test]
+    fn version_needed_by_method() {
+        // Method minimums (APPNOTE §4.4.3.2).
+        assert_eq!(method_version_needed(CompressionMethod::Stored), 20);
+        assert_eq!(method_version_needed(CompressionMethod::Deflate), 20);
+        assert_eq!(method_version_needed(CompressionMethod::Bzip2), 46);
+        assert_eq!(method_version_needed(CompressionMethod::Lzma), 63);
+        assert_eq!(method_version_needed(CompressionMethod::Zstd), 45);
+
+        // End to end: a BZIP2 entry raises the local header above the 4.5
+        // ZIP64 floor, and the CD matches it when no ZIP64 extra is
+        // needed.
+        let zip = collect_archive(|archive, out| {
+            let mut buf = BytesMut::new();
+            archive.start_file(
+                "a.bin".try_into().unwrap(),
+                MsDosDateTime::default(),
+                CompressionMethod::Bzip2,
+                &mut buf,
+            );
+            emit(&mut buf, out);
+            archive.file_data(b"payload");
+            out.extend_from_slice(b"payload");
+            archive.end_file_compressed(7, &mut buf);
+            emit(&mut buf, out);
+            archive.finish(&mut buf);
+            emit(&mut buf, out);
+        });
+        assert_eq!(u16le(&zip, 4), 46, "local version needed");
+        let eocd = zip.len() - 22;
+        let cd_offset = u32le(&zip, eocd + 16) as usize;
+        assert_eq!(
+            u16le(&zip, cd_offset + 4),
+            VERSION_MADE_BY_OS | method_version_needed(CompressionMethod::Bzip2),
+            "cd made by"
+        );
+        assert_eq!(u16le(&zip, cd_offset + 6), 46, "cd version needed");
+        assert_eq!(u16le(&zip, cd_offset + 30), 0, "no ZIP64 extra");
     }
 
     #[test]
