@@ -383,8 +383,21 @@ impl ZipArchive {
     /// # Panics
     ///
     /// Panics if no file is currently active (i.e. [`start_file`](Self::start_file)
-    /// was not called or the file was already ended).
+    /// was not called or the file was already ended), or if the active file
+    /// uses a compressed method - use
+    /// [`end_file_compressed`](Self::end_file_compressed) for those.
     pub fn end_file(&mut self, buf: &mut BytesMut) {
+        // Check the method before taking the entry out: a failed assert
+        // (catchable with `catch_unwind`) must leave the entry active
+        // rather than lose it from both `active` and the central
+        // directory, which finish() would then silently omit.
+        if let Some(active) = self.active.as_ref() {
+            assert!(
+                active.method == CompressionMethod::Stored,
+                "end_file() called on a {:?} entry; use end_file_compressed() to finalize compressed entries",
+                active.method
+            );
+        }
         let active = self.active.take().expect("no active file");
         let crc32 = active.crc.finalize();
         let size = active.uncompressed_size;
@@ -413,8 +426,20 @@ impl ZipArchive {
     /// # Panics
     ///
     /// Panics if no file is currently active (i.e. [`start_file`](Self::start_file)
-    /// was not called or the file was already ended).
+    /// was not called or the file was already ended), or if the active file
+    /// is [`Stored`](CompressionMethod::Stored) - use
+    /// [`end_file`](Self::end_file) for those.
     pub fn end_file_compressed(&mut self, compressed_size: u64, buf: &mut BytesMut) {
+        // Check the method before taking the entry out: a failed assert
+        // (catchable with `catch_unwind`) must leave the entry active
+        // rather than lose it from both `active` and the central
+        // directory, which finish() would then silently omit.
+        if let Some(active) = self.active.as_ref() {
+            assert!(
+                active.method != CompressionMethod::Stored,
+                "end_file_compressed() called on a Stored entry; use end_file() to finalize stored entries"
+            );
+        }
         let active = self.active.take().expect("no active file");
         let crc32 = active.crc.finalize();
 
@@ -832,6 +857,77 @@ mod tests {
         assert_eq!(u32le(&zip, cd), SIG_CENTRAL, "CD sig");
         let ext_attr = u32le(&zip, cd + 38);
         assert_eq!(ext_attr >> 16 & 0o170_000, 0o040_000, "S_IFDIR bit");
+    }
+
+    #[test]
+    #[should_panic(expected = "end_file() called on a Deflate entry")]
+    fn end_file_rejects_compressed_entry() {
+        let mut archive = ZipArchive::new();
+        let mut buf = BytesMut::new();
+        archive.start_file(
+            "a.txt".try_into().unwrap(),
+            MsDosDateTime::default(),
+            CompressionMethod::Deflate,
+            &mut buf,
+        );
+        archive.file_data(b"data");
+        archive.end_file(&mut buf);
+    }
+
+    #[test]
+    #[should_panic(expected = "end_file_compressed() called on a Stored entry")]
+    fn end_file_compressed_rejects_stored_entry() {
+        let mut archive = ZipArchive::new();
+        let mut buf = BytesMut::new();
+        archive.start_file(
+            "a.txt".try_into().unwrap(),
+            MsDosDateTime::default(),
+            CompressionMethod::Stored,
+            &mut buf,
+        );
+        archive.file_data(b"data");
+        archive.end_file_compressed(4, &mut buf);
+    }
+
+    // std-only: swapping the panic hook keeps the caught panic out of the
+    // test output, and the panic hook API is not available in no_std.
+    #[cfg(feature = "std")]
+    #[test]
+    fn wrong_finalizer_panic_leaves_the_entry_active() {
+        // The method check runs before the entry is taken out, so a
+        // caught panic (catch_unwind, a test harness) must leave the
+        // entry usable: the right finalizer completes it and finish()
+        // still records it in the central directory.
+        use std::panic::{self, AssertUnwindSafe};
+
+        let mut archive = ZipArchive::new();
+        let mut buf = BytesMut::new();
+        archive.start_file(
+            "a.txt".try_into().unwrap(),
+            MsDosDateTime::default(),
+            CompressionMethod::Deflate,
+            &mut buf,
+        );
+        archive.file_data(b"data");
+
+        let prev_hook = panic::take_hook();
+        panic::set_hook(Box::new(|_| {}));
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            archive.end_file(&mut buf);
+        }));
+        panic::set_hook(prev_hook);
+        assert!(result.is_err(), "end_file() on a Deflate entry must panic");
+
+        archive.end_file_compressed(4, &mut buf);
+        archive.finish(&mut buf);
+
+        // The entry reached the central directory: it follows the local
+        // header (30 + 5 name bytes) and the 16-byte data descriptor.
+        // The data bytes themselves are written by the caller, not by
+        // cerniera, so they are not in `buf` here.
+        let cd = 30 + 5 + 16;
+        assert_eq!(u32le(&buf, cd), SIG_CENTRAL);
+        assert_eq!(&buf[cd + 46..cd + 51], b"a.txt");
     }
 
     #[test]
