@@ -277,6 +277,50 @@ struct ActiveFile {
     crc: Crc32Hasher,
 }
 
+/// Whether an entry is a file or a directory; determines the local
+/// header's general-purpose flag bits and version.
+#[derive(Clone, Copy)]
+enum EntryKind {
+    /// A file entry: its local header is written before the sizes are
+    /// known, so CRC and sizes are deferred to a data descriptor (GP bit
+    /// 3) and ZIP64 capability is declared up front.
+    File,
+    /// A directory entry: zero-length by definition, so its local header
+    /// is complete at write time - no data descriptor (APPNOTE 4.4.3.2:
+    /// 2.0 - file is a folder).
+    Directory,
+}
+
+impl EntryKind {
+    /// General-purpose flag bits shared by the local and central
+    /// directory headers: bit 11 (UTF-8 name) for both kinds, plus bit 3
+    /// (data descriptor) for files only.
+    fn gp_flag(self) -> u16 {
+        match self {
+            EntryKind::File => 0x0808,
+            EntryKind::Directory => 0x0800,
+        }
+    }
+
+    /// Version needed for the entry's local header (APPNOTE 4.4.3.1: the
+    /// highest applicable feature).
+    fn local_version(self, method: CompressionMethod) -> u16 {
+        match self {
+            EntryKind::File => u16::max(method_version_needed(method), VERSION_ZIP64),
+            EntryKind::Directory => 20,
+        }
+    }
+
+    /// Whether a path names a directory entry (trailing `/`).
+    fn for_path(path: &str) -> Self {
+        if path.ends_with('/') {
+            EntryKind::Directory
+        } else {
+            EntryKind::File
+        }
+    }
+}
+
 // ── ZipArchive ────────────────────────────────────────────────────────────────
 
 /// Low-level, sans-IO ZIP64 archive encoder.
@@ -341,11 +385,7 @@ impl ZipArchive {
 
         let local_offset = self.offset;
         let before = buf.len();
-        // The local header is written before the entry's sizes are known,
-        // so it always declares ZIP64 capability alongside the method
-        // minimum (APPNOTE §4.4.3.1: the highest applicable feature).
-        let version = u16::max(method_version_needed(method), VERSION_ZIP64);
-        encode_local_header(path.as_str(), modified, method, version, buf);
+        encode_local_header(path.as_str(), modified, method, EntryKind::File, buf);
         self.offset += (buf.len() - before) as u64;
 
         self.active = Some(ActiveFile {
@@ -463,7 +503,10 @@ impl ZipArchive {
         });
     }
 
-    /// Encode a directory entry (local header + data descriptor) into `buf`.
+    /// Encode a directory entry (local header) into `buf`.
+    ///
+    /// A directory is zero-length by definition, so the local header
+    /// carries no data descriptor.
     ///
     /// # Panics
     ///
@@ -474,18 +517,13 @@ impl ZipArchive {
 
         let local_offset = self.offset;
         let before = buf.len();
-        let version = u16::max(
-            method_version_needed(CompressionMethod::Stored),
-            VERSION_ZIP64,
-        );
         encode_local_header(
             path.as_str(),
             modified,
             CompressionMethod::Stored,
-            version,
+            EntryKind::Directory,
             buf,
         );
-        encode_data_descriptor(0, 0, 0, buf);
         self.offset += (buf.len() - before) as u64;
 
         self.cd.push(CdEntry {
@@ -546,10 +584,9 @@ impl Default for ZipArchive {
 
 /// Local file header: 30 bytes fixed + `name.len()`.
 ///
-/// CRC-32 and sizes are all zero because GP bit 3 (data descriptor) is
-/// set: the local header is written before the sizes are known, so the
-/// real values appear in the data descriptor that follows the file data
-/// and in the central directory.
+/// CRC-32 and sizes are all zero: for files GP bit 3 (data descriptor)
+/// is set because the header is written before the sizes are known, and
+/// for directories the size is known to be zero.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "ZipPath guarantees the name fits in u16"
@@ -558,15 +595,15 @@ fn encode_local_header(
     path: &str,
     modified: MsDosDateTime,
     method: CompressionMethod,
-    version: u16,
+    kind: EntryKind,
     b: &mut BytesMut,
 ) {
     let name = path.as_bytes();
     b.reserve(30 + name.len());
 
     b.put_u32_le(SIG_LOCAL);
-    b.put_u16_le(version);
-    b.put_u16_le(0x0808); // GP flag: bit 3 = data descriptor, bit 11 = UTF-8
+    b.put_u16_le(kind.local_version(method));
+    b.put_u16_le(kind.gp_flag());
     b.put_u16_le(method as u16);
     b.put_u16_le(modified.time);
     b.put_u16_le(modified.date);
@@ -622,10 +659,10 @@ fn encode_data_descriptor(
 )]
 fn encode_cd_entry(e: &CdEntry, b: &mut BytesMut) {
     let name = e.path.as_str().as_bytes();
-    let external_attr: u32 = if e.path.as_str().ends_with('/') {
-        0o40_755 << 16 // S_IFDIR + rwxr-xr-x
-    } else {
-        0o100_644 << 16 // S_IFREG + rw-r--r--
+    let kind = EntryKind::for_path(e.path.as_str());
+    let external_attr: u32 = match kind {
+        EntryKind::Directory => 0o40_755 << 16, // S_IFDIR + rwxr-xr-x
+        EntryKind::File => 0o100_644 << 16,     // S_IFREG + rw-r--r--
     };
 
     // A 32-bit field that cannot hold the value becomes a sentinel and is
@@ -660,7 +697,7 @@ fn encode_cd_entry(e: &CdEntry, b: &mut BytesMut) {
     // cerniera itself implements.
     b.put_u16_le(VERSION_MADE_BY_OS | u16::max(version, VERSION_ZIP64));
     b.put_u16_le(version);
-    b.put_u16_le(0x0808); // GP flag: bit 3 = data descriptor, bit 11 = UTF-8
+    b.put_u16_le(kind.gp_flag());
     b.put_u16_le(e.method as u16);
     b.put_u16_le(e.modified.time);
     b.put_u16_le(e.modified.date);
@@ -1034,11 +1071,19 @@ mod tests {
             emit(&mut buf, out);
         });
 
+        // Local header: folder version, no data-descriptor bit, and no
+        // descriptor after the header - the CD follows immediately.
+        assert_eq!(u16le(&zip, 4), 20, "local version needed (folder)");
+        assert_eq!(u16le(&zip, 6), 0x0800, "local flags: no data descriptor");
         let name_len = u16le(&zip, 26) as usize;
-        // local header + 0 payload + 16-byte descriptor
-        let cd = 30 + name_len + 16;
+        let cd = 30 + name_len;
 
         assert_eq!(u32le(&zip, cd), SIG_CENTRAL, "CD sig");
+        assert_eq!(u16le(&zip, cd + 6), 20, "cd version needed (folder)");
+        assert_eq!(u16le(&zip, cd + 8), 0x0800, "cd flags: no data descriptor");
+        assert_eq!(u32le(&zip, cd + 20), 0, "comp size zero");
+        assert_eq!(u32le(&zip, cd + 24), 0, "orig size zero");
+        assert_eq!(u16le(&zip, cd + 30), 0, "no ZIP64 extra");
         let ext_attr = u32le(&zip, cd + 38);
         assert_eq!(ext_attr >> 16 & 0o170_000, 0o040_000, "S_IFDIR bit");
     }
