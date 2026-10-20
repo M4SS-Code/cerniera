@@ -29,7 +29,7 @@ jiff = "0.2"
 memmap2 = "0.9"
 rustix = { version = "1", features = ["fs"] }
 tokio = { version = "1", features = ["macros", "rt", "io-util", "fs"] }
-zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 
 [package.metadata.docs.rs]
 all-features = true
